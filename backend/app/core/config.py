@@ -1,6 +1,9 @@
 """
 QuantDSS Configuration — Pydantic BaseSettings
 Reads all configuration from environment variables / .env file.
+
+Critical Fix 4 (Audit): Removed insecure default credentials.
+SECRET_KEY, DEFAULT_USERNAME, and DEFAULT_PASSWORD must be set in .env.
 """
 
 from pydantic_settings import BaseSettings
@@ -11,7 +14,7 @@ class Settings(BaseSettings):
 
     # ─── Application ────────────────────────────────────────
     app_env: str = "development"
-    secret_key: str = "change-this-to-a-random-64-char-string"
+    secret_key: str = ""  # REQUIRED — must be set in .env
     allowed_origins: str = "http://localhost:3000,http://localhost"
     log_level: str = "INFO"
 
@@ -21,7 +24,7 @@ class Settings(BaseSettings):
     # ─── Redis ──────────────────────────────────────────────
     redis_url: str = "redis://:password@redis:6379/0"
 
-    # ─── Broker: Shoonya (Finvasia) — PRIMARY ───────────────
+    # ─── Broker: Shoonya (Finvasia) ───────────────────────────
     shoonya_user_id: str | None = None
     shoonya_password: str | None = None
     shoonya_totp_secret: str | None = None
@@ -31,6 +34,7 @@ class Settings(BaseSettings):
 
     # ─── Broker: Angel One SmartAPI — FALLBACK ──────────────
     angel_api_key: str | None = None
+    angel_api_secret: str | None = None
     angel_client_id: str | None = None
     angel_password: str | None = None
     angel_totp_secret: str | None = None
@@ -63,15 +67,46 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_seconds: int = 86400  # 24 hours
 
-    # ─── Default User (single-user system) ──────────────────
-    default_username: str = "trader"
-    default_password: str = "quantdss2025"
+    # ─── Trading Mode ────────────────────────────────────────
+    # Controls default execution mode: "disabled", "paper", or "live".
+    # The active mode is always read from AutoTradeConfig.mode (DB) at runtime;
+    # this setting only determines the default seeded into the DB on first run.
+    trading_mode: str = "paper"
+
+    # Safety lock for LIVE mode — must be set in .env (never in code).
+    # TradingModeController reads this directly from os.environ.
+    # See app/engine/trading_mode.py for enforcement logic.
+    live_trading_lock: str = ""  # Set to "CONFIRMED" in .env to enable LIVE mode.
+
+    # ─── Default User (single-user system) ───────────────────
+    # REQUIRED — must be set in .env as DEFAULT_USERNAME / DEFAULT_PASSWORD.
+    default_username: str = ""
+    default_password: str = ""
 
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
     }
+
+    def validate_security(self) -> None:
+        """
+        Critical Fix 4 (Audit): Validate that security-critical settings
+        are configured. Called at application startup.
+        Raises RuntimeError if any required setting is missing.
+        """
+        errors = []
+        if not self.secret_key or self.secret_key == "change-this-to-a-random-64-char-string":
+            errors.append("SECRET_KEY must be set in .env (use a random 64+ char string)")
+        if not self.default_username:
+            errors.append("DEFAULT_USERNAME must be set in .env")
+        if not self.default_password:
+            errors.append("DEFAULT_PASSWORD must be set in .env")
+        if errors:
+            raise RuntimeError(
+                "Security validation failed. Fix these issues in your .env file:\n  - "
+                + "\n  - ".join(errors)
+            )
 
 
 # Singleton settings instance

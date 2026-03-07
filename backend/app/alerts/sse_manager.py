@@ -63,6 +63,10 @@ class SSEManager:
             # Send initial connection confirmation
             yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
 
+            # FIX #4: heartbeat counter — emit every 30 iterations (30 seconds),
+            # not every 1s which was flooding clients with 300 msgs/min
+            _hb_tick = 0
+
             while True:
                 message = await pubsub.get_message(
                     ignore_subscribe_messages=True,
@@ -76,7 +80,11 @@ class SSEManager:
                     yield f"event: signal\ndata: {data}\n\n"
 
                 # Heartbeat every 30 seconds to keep connection alive
-                yield f"event: heartbeat\ndata: {json.dumps({'ts': datetime.now(UTC).isoformat()})}\n\n"
+                _hb_tick += 1
+                if _hb_tick >= 30:
+                    yield f"event: heartbeat\ndata: {json.dumps({'ts': datetime.now(UTC).isoformat()})}\n\n"
+                    _hb_tick = 0
+
                 await asyncio.sleep(1)
 
         except asyncio.CancelledError:

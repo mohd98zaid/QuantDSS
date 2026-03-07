@@ -1,104 +1,119 @@
-# QuantDSS Architecture & Data Flow
+# QuantDSS Architecture
 
-## 1. High-Level Architecture Diagram
+> Quantitative Decision Support & Execution System for Intraday Indian Equity Markets
 
-```mermaid
-graph TD
-    %% External Systems
-    Broker[Broker APIs: Shoonya/Angel]
-    YFinance[yfinance API]
-    Telegram[Telegram API]
+## System Overview
 
-    %% Ingestion Layer
-    subgraph Ingestion Layer
-        BA[Broker Adapter]
-        TN[Tick Normaliser]
-        CA[Candle Aggregator]
-    end
+QuantDSS is an **automated intraday trading platform** for Indian equities (NSE).
+It ingests live market data, evaluates quantitative strategies, filters signals
+through an 11-layer intelligence pipeline, validates risk, and executes trades
+via broker APIs — all in real time.
 
-    %% Core Engine
-    subgraph Core Engine
-        SR[Strategy Runner]
-        IE[Indicator Engine]
-        RE[Risk Engine]
-    end
-
-    %% Storage
-    subgraph Storage
-        PG[(PostgreSQL + TimescaleDB)]
-        RD[(Redis)]
-    end
-
-    %% Pipeline & Dispatch
-    subgraph Pipeline
-        SP[Signal Pipeline]
-        AD[Alert Dispatcher]
-        SSE[SSE Streamer]
-    end
-
-    %% Frontend
-    subgraph Frontend
-        D[Next.js Dashboard]
-    end
-
-    %% Data Connections
-    Broker -->|Websocket Ticks| BA
-    YFinance -->|Historical Data| PG
-    BA --> TN
-    TN --> CA
-    CA -->|Closed Candles| SP
-
-    %% Evaluational Flow
-    SP -->|Evaluate| SR
-    SR <-->|Compute| IE
-    SR -->|Raw Signal| SP
-
-    SP -->|Validate| RE
-    RE <-->|State/Config| PG
-    RE -->|Risk Decision| SP
-
-    %% Dispatch Flow
-    SP -->|Log Decision| PG
-    SP -->|Dispatch Outcome| AD
-
-    AD -->|Publish Event| RD
-    RD --> SSE
-    SSE -->|Live Updates| D
-
-    AD -->|Formatted Alert| Telegram
-
-    %% App Services
-    Celery[Celery Workers] -->|Scheduled Tasks| YFinance
+```
+Broker APIs ──► Tick Ingestion ──► Candle Aggregation ──► Strategy Evaluation
+                                                                │
+                                  ┌─────────────────────────────┘
+                                  ▼
+                        Intelligence Pipeline (11 layers)
+                                  │
+                                  ▼
+                        Risk Engine (17 rules)
+                                  │
+                              ┌───┴───┐
+                              ▼       ▼
+                          AutoTrader  UI (SSE)
+                          (Paper/Live)
 ```
 
-## 2. Data Flow Lifecycle
+---
 
-1. **Market Data Ingestion**:
-   - The **Broker Adapter** connects to the broker's WebSocket (e.g., Shoonya or Angel) to receive real-time price ticks.
-   - The **Tick Normaliser** converts raw broker-specific ticks into a standard JSON format.
-   - The **Candle Aggregator** batches these ticks in-memory into 1-minute, 5-minute, or daily OHLCV candles based on active timeframes.
+## Core Components
 
-2. **Strategy Evaluation**:
-   - Once a candle closes, it is passed to the **Signal Pipeline**, which fetches the historical lookback window from the database.
-   - The Pipeline asks the **Strategy Runner** to evaluate the data.
-   - The **Indicator Engine** calculates required vectorised indicators (EMA, RSI, ATR) using the pure-Python `ta` library.
-   - Strategies (e.g., EMA Crossover) evaluate the indicators against rule-sets and generate an unvalidated `RawSignal` (BUY/SELL).
+### 1. Market Data Ingestion
 
-3. **Risk Validation (Fail-Fast)**:
-   - The `RawSignal` is routed to the **Risk Engine**.
-   - It checks the system's Daily Risk State and evaluates the signal against 7 sequential rules: **Daily Loss, Drawdown, Cooldown, Volatility (ATR), Position Sizing, Max Position Cap, and Max Concurrent Positions**.
-   - If ANY rule fails, the signal receives a `BLOCKED` (hard fail) or `SKIPPED` (soft fail) status. If all rules pass, it is `APPROVED` and assigned a calculated quantity.
+- **WebSocket Manager** — connects to Upstox/Angel One for live tick data
+- **Candle Aggregator** — builds 1-minute OHLCV candles from ticks, publishes to Redis Stream `market:candles`
+- **Market Data Cache** — in-memory LTP, volume, and spread cache
 
-4. **Persistence & Alert Dispatch**:
-   - The Signal Pipeline logs the final signal, the risk decision, and an audit trail to **PostgreSQL**.
-   - The pipeline hands the result to the **Alert Dispatcher**.
-   - The Dispatcher publishes the event to **Redis Pub/Sub**, which streams it via **Server-Sent Events (SSE)** directly to the Next.js **Dashboard** for instant UI updates.
-   - Concurrently, a formatted message is pushed to the user via the **Telegram Bot** (Note: `SKIPPED` signals are omitted from Telegram to reduce noise).
+### 2. Strategy Engine
 
-## 3. Key Architectural Design Points
+- **Strategy Runner** — loads strategies from DB, evaluates each against candle DataFrames
+- **Base Strategy** — abstract class; strategies produce `CandidateSignal` objects only (no DB/broker access)
+- **Strategies**: EMA Crossover, RSI Mean Reversion, ORB+VWAP, Volume Expansion, Trend Continuation, VWAP Reclaim, Relative Strength, Trend Pullback
 
-- **Fail-Fast Risk Engine**: Risk management is enforced stringently. Rules are evaluated sequentially—a hard block (like Daily Loss Limit reached) immediately halts trading globally, refusing subsequent signals without wasting compute cycles.
-- **Stateless & Idempotent Evaluation**: The strategy engine is stateless. It recalculates indicators dynamically over a database lookback window rather than maintaining complex, stateful in-memory arrays. This makes it highly resilient to restarts and network drops.
-- **Asynchronous & Non-Blocking**: Built entirely on Python's `asyncio` ecosystem (FastAPI, `asyncpg`, continuous Redis pipelines), ensuring that I/O operations (like waiting for database inserts or Telegram HTTP responses) do not block the critical tick aggregation thread.
-- **TimescaleDB for Time-Series**: Market data (ticks and candles) are stored in TimescaleDB hypertables. This provides hyper-fast analytical queries and automatic data retention/compression for historical candles.
-- **Decision Support, Not Execution**: By design, the system **does not orchestrate automated trading**. It calculates sizes, stop-losses, targets, and enforces limits, but alerts the human trader who must manually click the "execute" button. This forces psychological discipline while removing the math burden.
+### 3. Signal Intelligence Pipeline (11 Layers)
+
+All signals pass through these layers in order. No bypass is permitted.
+
+| #   | Layer                    | Module                      | Purpose                                                    |
+| --- | ------------------------ | --------------------------- | ---------------------------------------------------------- |
+| 1   | Signal Deduplication     | `signal_dedup.py`           | Prevent duplicate signals within TTL window                |
+| 2   | Signal Pool              | `signal_pool.py`            | Buffer + group signals by symbol                           |
+| 3   | Consolidation            | `consolidation_layer.py`    | Merge concurrent signals, resolve conflicts                |
+| 4   | **Meta-Strategy Engine** | `meta_strategy_engine.py`   | Block disabled strategies + regime-incompatible strategies |
+| 5   | Confirmation             | `confirmation_layer.py`     | Require multi-strategy alignment                           |
+| 6   | Quality Score            | `quality_score_layer.py`    | Score on volume, trend, VWAP, spread                       |
+| 7   | **Market Regime Filter** | `market_regime_filter.py`   | Block signals incompatible with current regime             |
+| 8   | ML Filter                | `ml_filter_layer.py`        | Win probability prediction (shadow mode)                   |
+| 9   | NLP Filter               | `nlp_filter_layer.py`       | News sentiment check (shadow mode)                         |
+| 10  | Time Filter              | `time_filter_layer.py`      | Enforce trading time windows                               |
+| 11  | **Liquidity Filter**     | `liquidity_filter_layer.py` | Minimum volume ratio + max spread check                    |
+
+### 4. Risk Engine (17 Rules)
+
+- Located in `risk_engine.py`, called by `FinalAlertGenerator`
+- Fail-fast ordered chain: daily loss, drawdown, cooldown, volatility, position sizing, max positions, duplicate, consecutive loss, weekly loss, and more
+- Returns `RiskDecision` with status (APPROVED / BLOCKED / SKIPPED), quantity, and risk amount
+
+### 5. Final Alert Generator
+
+- Terminus of the intelligence pipeline
+- Calls Risk Engine (mandatory), persists all signals to DB, publishes via SSE, enqueues APPROVED signals to AutoTrader queue
+
+### 6. AutoTrader
+
+- **Reactive mode**: processes signals from the AutoTrader queue (fed by FinalAlertGenerator)
+- **Scheduled mode**: scans watchlist every 5 min, routes signals through the intelligence pipeline (not bypassed)
+- Supports both **paper** and **live** trading modes
+- Live mode uses `ExecutionManager` for bracket orders via broker API
+
+### 7. Supporting Components
+
+- **Strategy Health Monitor** — tracks win rate per strategy, auto-disables poor performers
+- **Regime Detector** — classifies market as TREND / RANGE / HIGH_VOLATILITY / LOW_LIQUIDITY
+- **Signal Tracer** — 18-stage trace IDs for debugging signal flow
+- **Candle Consumer** — Redis Stream consumer that feeds strategy evaluation
+
+---
+
+## Data Flow
+
+```
+1. Ticks arrive via WebSocket
+2. CandleAggregator → 1-min candles → Redis Stream
+3. CandleConsumer reads stream → builds DataFrame → StrategyRunner
+4. Strategies produce CandidateSignals
+5. SignalDedup → SignalPool → Consolidation → MetaStrategy
+   → Confirmation → QualityScore → RegimeFilter
+   → ML → NLP → TimeFilter → LiquidityFilter
+6. FinalAlertGenerator → RiskEngine validation
+7. APPROVED → AutoTraderQueue → _open_trade (paper or live)
+   BLOCKED  → persisted + SSE notification
+```
+
+---
+
+## Deployment
+
+- **Monolith mode** (`WORKER_MODE=monolith`): all components in one process
+- **Distributed mode**: CandleConsumer runs as a separate service
+
+---
+
+## Key Design Rules
+
+1. **Single pipeline** — every signal (scanner, scheduled, real-time) passes through all 11 intelligence layers
+2. **Risk Engine is mandatory** — no trade executes without Risk Engine validation
+3. **Strategy isolation** — strategies only return signals, no side effects
+4. **Meta-Strategy control** — disabled/regime-blocked strategies are filtered before confirmation
+5. **Signal traceability** — every signal gets a trace_id tracked across 18 stages

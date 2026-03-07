@@ -12,6 +12,7 @@ class Symbol(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     trading_symbol = Column(String(50), nullable=False, unique=True)
     exchange = Column(String(10), nullable=False, default="NSE")
+    instrument_key = Column(String(50), nullable=True)  # Upstox key e.g. NSE_EQ|INE848E01016
     instrument_token = Column(BigInteger, nullable=True)
     lot_size = Column(Integer, default=1)
     tick_size = Column(Numeric(10, 4), nullable=True)

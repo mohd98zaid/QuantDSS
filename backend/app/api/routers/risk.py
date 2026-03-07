@@ -22,7 +22,18 @@ async def get_risk_config(
     result = await db.execute(select(RiskConfig))
     config = result.scalar_one_or_none()
     if not config:
-        raise HTTPException(status_code=404, detail="Risk config not found. Run seed script first.")
+        # Seed not yet run — return sensible defaults so the Settings UI can render
+        return RiskConfigResponse(
+            risk_per_trade_pct=0.5,
+            max_daily_loss_inr=5000.0,
+            max_daily_loss_pct=2.0,
+            max_account_drawdown_pct=5.0,
+            cooldown_minutes=15,
+            min_atr_pct=0.3,
+            max_atr_pct=5.0,
+            max_position_pct=10.0,
+            max_concurrent_positions=2,
+        )
     return config
 
 
@@ -42,9 +53,10 @@ async def update_risk_config(
     for field, value in update_data.items():
         setattr(config, field, value)
 
-    await db.flush()
+    await db.commit()  # FIX #3: was flush() — changes were silently discarded on session end
     await db.refresh(config)
     return config
+
 
 
 @router.get("/risk/state", response_model=RiskStateResponse)
@@ -59,7 +71,21 @@ async def get_risk_state(
     )
     state = result.scalar_one_or_none()
     if not state:
-        raise HTTPException(status_code=404, detail="No risk state for today. System may not have started.")
+        # No row yet for today — return a safe default (system not halted)
+        return RiskStateResponse(
+            trade_date=today,
+            account_balance=None,
+            max_daily_loss=None,
+            realised_pnl=0.0,
+            remaining_daily_buffer=0.0,
+            trades_taken=0,
+            signals_approved=0,
+            signals_blocked=0,
+            signals_skipped=0,
+            is_halted=False,
+            halt_reason=None,
+            max_concurrent_positions=2,
+        )
 
     config_result = await db.execute(select(RiskConfig))
     config = config_result.scalar_one_or_none()

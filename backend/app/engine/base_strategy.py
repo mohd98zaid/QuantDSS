@@ -2,23 +2,45 @@
 BaseStrategy — Abstract interface for all trading strategies.
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import pandas as pd
 
 
+from typing import Dict, Any, List
+
 @dataclass
-class RawSignal:
-    """Raw signal output from a strategy before risk validation."""
+class CandidateSignal:
+    """Phase 1: Standardized candidate signal emitted by strategies."""
     symbol_id: int
     strategy_id: int
-    signal_type: str       # BUY / SELL / EXIT
+    strategy_name: str
+    signal_type: str       # BUY / SELL
     entry_price: float
     stop_loss: float
     target_price: float
     atr_value: float
     candle_time: datetime
+    confidence_score: float = 0.0   # 0-100
+    
+    # Phase 1 specific fields
+    symbol_name: str = ""
+    strategies: List[str] = field(default_factory=list)
+    base_strategy: str = ""
+    indicator_snapshot: Dict[str, Any] = field(default_factory=dict)
+    market_snapshot: Dict[str, Any] = field(default_factory=dict)
+    volume_ratio: float = 1.0
+    spread: float = 0.0
+    relative_strength: float = 0.0
+    market_regime: str | None = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.base_strategy:
+            self.base_strategy = self.strategy_name
+        if not self.strategies:
+            self.strategies = [self.strategy_name]
 
     @property
     def risk_reward(self) -> float:
@@ -51,7 +73,7 @@ class BaseStrategy(ABC):
         self.params = params
 
     @abstractmethod
-    def evaluate(self, candles: pd.DataFrame, symbol_id: int) -> RawSignal | None:
+    def evaluate(self, candles: pd.DataFrame, symbol_id: int) -> CandidateSignal | None:
         """
         Evaluate strategy conditions on the latest candles.
 
@@ -61,7 +83,7 @@ class BaseStrategy(ABC):
             symbol_id: Database ID of the symbol being evaluated.
 
         Returns:
-            RawSignal if entry conditions are met, else None.
+            CandidateSignal if entry conditions are met, else None.
         """
         pass
 
@@ -75,3 +97,11 @@ class BaseStrategy(ABC):
     def min_candles_required(self) -> int:
         """Minimum number of candles needed for reliable indicator computation."""
         return 100  # Default: 100 candles
+
+
+# ── Backward-compat alias ──────────────────────────────────────────
+# Several modules (risk_engine, signal_pipeline, auto_trader_engine,
+# alert_dispatcher, telegram_notifier, tests) import "RawSignal".
+# The class was renamed to CandidateSignal during Phase 1 refactoring
+# but the old name was never aliased, causing ImportError at startup.
+RawSignal = CandidateSignal

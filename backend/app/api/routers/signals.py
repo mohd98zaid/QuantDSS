@@ -60,9 +60,66 @@ async def get_signal(
     _user: dict = Depends(get_current_user),
 ):
     """Get full detail of a single signal."""
-    from fastapi import HTTPException
-    result = await db.execute(select(Signal).where(Signal.id == signal_id))
     signal = result.scalar_one_or_none()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
     return SignalResponse.model_validate(signal)
+
+
+@router.get("/signals/export")
+async def export_signals(
+    status: str | None = Query(None, description="APPROVED / BLOCKED / SKIPPED / ALL"),
+    symbol: str | None = None,
+    strategy_id: int | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+    db: AsyncSession = Depends(get_session),
+    _user: dict = Depends(get_current_user),
+):
+    """Export signals to a CSV file."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+    
+    query = select(Signal).order_by(Signal.timestamp.desc())
+
+    if status and status.upper() != "ALL":
+        query = query.where(Signal.risk_status == status.upper())
+    if symbol:
+        query = query.where(Signal.symbol == symbol)
+    if strategy_id:
+        query = query.where(Signal.strategy_id == strategy_id)
+    if from_date:
+        query = query.where(func.date(Signal.timestamp) >= from_date)
+    if to_date:
+        query = query.where(func.date(Signal.timestamp) <= to_date)
+        
+    result = await db.execute(query)
+    signals = result.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow([
+        "ID", "Timestamp", "Symbol", "Strategy ID", "Type", 
+        "Entry Price", "Stop Loss", "Target Price", 
+        "Quantity", "Risk Amount", "Risk Reward", "ATR %", 
+        "Status", "Reason"
+    ])
+    
+    # Write rows
+    for s in signals:
+        writer.writerow([
+            s.id, s.timestamp, s.symbol, s.strategy_id, s.signal_type,
+            s.entry_price, s.stop_loss, s.target_price,
+            s.quantity, s.risk_amount, s.risk_reward, round(s.atr_pct, 4) if s.atr_pct else "",
+            s.risk_status, s.block_reason
+        ])
+        
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]), 
+        media_type="text/csv", 
+        headers={"Content-Disposition": "attachment; filename=signals.csv"}
+    )

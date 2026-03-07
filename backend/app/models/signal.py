@@ -26,6 +26,16 @@ class Signal(Base):
     atr_value = Column(Numeric(12, 4))
     atr_pct = Column(Numeric(6, 4))
     candle_time = Column(DateTime(timezone=True))
+    # Phase 1: Signal Scoring Engine
+    confidence_score = Column(Integer, nullable=True)          # 0–100
+    confidence_tier  = Column(String(10), nullable=True)       # HIGH / MEDIUM / REJECT
+    score_breakdown  = Column(Text, nullable=True)             # JSON breakdown
+    # Phase 5: Latency tracking
+    latency_ms = Column(Integer, nullable=True)                # tick-to-signal ms
+    # Phase 8: Intelligence pipeline metadata (Corrective Refactor)
+    ml_probability = Column(Numeric(6, 4), nullable=True)      # ML model confidence
+    sentiment = Column(String(20), nullable=True)               # NLP sentiment
+    strategies_confirmed = Column(Text, nullable=True)          # JSON list of strategy names
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships

@@ -1,6 +1,7 @@
 """Strategy models — Strategy Definitions + Strategy-Symbol Mapping"""
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -14,7 +15,7 @@ class Strategy(Base):
     name = Column(String(100), nullable=False)
     type = Column(String(50), nullable=True)  # trend_following, mean_reversion
     description = Column(Text, nullable=True)
-    parameters = Column(JSONB, nullable=False)
+    parameters = Column(JSON().with_variant(JSONB, 'postgresql'), nullable=False)
     is_active = Column(Boolean, default=True)
     min_backtest_trades = Column(Integer, default=30)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

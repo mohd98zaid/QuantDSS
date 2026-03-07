@@ -4,6 +4,11 @@ uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9
 httpx>=0.27.0
 
+# Protobuf
+protobuf>=5.26.1
+grpcio-tools>=1.62.2
+
+
 # Database
 sqlalchemy[asyncio]>=2.0.30
 asyncpg>=0.29.0
@@ -24,15 +29,20 @@ bcrypt==4.0.1
 # Logging
 loguru>=0.7.0
 
+# Rate Limiting
+slowapi>=0.1.9
+
 # Technical Analysis (pure Python — no C compilation needed)
 pandas>=2.1.0
-numpy>=1.26.0,<2.0.0
+numpy>=1.26.0
 ta>=0.11.0
 
 # Broker APIs
 NorenRestApiPy==0.0.22
 smartapi-python>=1.3.0
 pyotp>=2.9.0
+logzero>=1.7.0
+websocket-client>=1.6.0
 
 # Historical Data
 yfinance>=0.2.30

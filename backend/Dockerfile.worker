@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install Python dependencies (same as API server)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Default: no CMD — override in docker-compose per worker
+# Examples:
+#   CMD ["python", "-m", "app.workers.signal_engine_worker"]
+#   CMD ["python", "-m", "app.workers.risk_engine_worker"]
+#   CMD ["python", "-m", "app.workers.autotrader_worker"]
+#   CMD ["python", "-m", "app.workers.trade_monitor_worker"]

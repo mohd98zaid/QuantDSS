@@ -6,7 +6,7 @@ Enter when fast EMA crosses above slow EMA with price above both and volume conf
 import pandas as pd
 
 from app.core.logging import logger
-from app.engine.base_strategy import BaseStrategy, RawSignal
+from app.engine.base_strategy import BaseStrategy, CandidateSignal
 from app.engine.indicators import IndicatorEngine
 
 
@@ -37,15 +37,18 @@ class EMACrossoverStrategy(BaseStrategy):
             self.params.get("atr_period", 14),
         ) + 5  # Buffer
 
-    def evaluate(self, candles: pd.DataFrame, symbol_id: int) -> RawSignal | None:
+    def evaluate(self, candles: pd.DataFrame, symbol_id: int) -> CandidateSignal | None:
         """Evaluate EMA crossover conditions on latest candles."""
         if len(candles) < self.min_candles_required:
             return None
 
-        # Compute indicators
-        df = IndicatorEngine.compute_strategy_indicators(
-            candles, self.strategy_type, self.params
-        )
+        # Compute indicators only if they don't exist (e.g. not precomputed by BacktestEngine)
+        if "ema_fast" not in candles.columns:
+            df = IndicatorEngine.compute_strategy_indicators(
+                candles, self.strategy_type, self.params
+            )
+        else:
+            df = candles
 
         # Need at least 2 rows with valid indicators
         if df["ema_fast"].isna().iloc[-1] or df["ema_slow"].isna().iloc[-1]:
@@ -79,20 +82,40 @@ class EMACrossoverStrategy(BaseStrategy):
             stop_loss = entry - (atr_sl * atr_curr)
             target = entry + (atr_target * atr_curr)
 
+            # Confidence score (0–100)
+            score = 50.0  # Base: required conditions met
+            if volume_ma_curr > 0:
+                rvol = volume_curr / volume_ma_curr
+                if rvol >= 2.0:
+                    score += 15.0
+                elif rvol >= 1.5:
+                    score += 8.0
+            ema_gap_pct = (ema_fast_curr - ema_slow_curr) / ema_slow_curr if ema_slow_curr > 0 else 0
+            score += min(15.0, ema_gap_pct * 500)  # up to +15 for strong gap
+            ema_slope = float(ema_fast_curr) - float(df["ema_fast"].iloc[-3]) if len(df) >= 3 else 0.0
+            if ema_slope > 0:
+                score += 10.0
+            atr_prev = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else atr_curr
+            if atr_curr > atr_prev:
+                score += 10.0  # ATR expanding
+            score = min(100.0, max(0.0, score))
+
             logger.info(
                 f"EMA Crossover BUY signal: {symbol_id} @ {entry:.2f} "
-                f"SL={stop_loss:.2f} T={target:.2f} ATR={atr_curr:.4f}"
+                f"SL={stop_loss:.2f} T={target:.2f} ATR={atr_curr:.4f} conf={score:.0f}"
             )
 
-            return RawSignal(
+            return CandidateSignal(
                 symbol_id=symbol_id,
                 strategy_id=self.strategy_id,
+                strategy_name=self.strategy_type,
                 signal_type="BUY",
                 entry_price=entry,
                 stop_loss=stop_loss,
                 target_price=target,
                 atr_value=atr_curr,
                 candle_time=candle_time,
+                confidence_score=score,
             )
 
         # ─── Check SHORT (SELL) conditions ────────────────────
@@ -107,20 +130,40 @@ class EMACrossoverStrategy(BaseStrategy):
             stop_loss = entry + (atr_sl * atr_curr)
             target = entry - (atr_target * atr_curr)
 
+            # Confidence score (mirrors BUY logic)
+            score = 50.0
+            if volume_ma_curr > 0:
+                rvol = volume_curr / volume_ma_curr
+                if rvol >= 2.0:
+                    score += 15.0
+                elif rvol >= 1.5:
+                    score += 8.0
+            ema_gap_pct = (ema_slow_curr - ema_fast_curr) / ema_slow_curr if ema_slow_curr > 0 else 0
+            score += min(15.0, ema_gap_pct * 500)
+            ema_slope = float(ema_fast_curr) - float(df["ema_fast"].iloc[-3]) if len(df) >= 3 else 0.0
+            if ema_slope < 0:
+                score += 10.0
+            atr_prev = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else atr_curr
+            if atr_curr > atr_prev:
+                score += 10.0
+            score = min(100.0, max(0.0, score))
+
             logger.info(
                 f"EMA Crossover SELL signal: {symbol_id} @ {entry:.2f} "
-                f"SL={stop_loss:.2f} T={target:.2f} ATR={atr_curr:.4f}"
+                f"SL={stop_loss:.2f} T={target:.2f} ATR={atr_curr:.4f} conf={score:.0f}"
             )
 
-            return RawSignal(
+            return CandidateSignal(
                 symbol_id=symbol_id,
                 strategy_id=self.strategy_id,
+                strategy_name=self.strategy_type,
                 signal_type="SELL",
                 entry_price=entry,
                 stop_loss=stop_loss,
                 target_price=target,
                 atr_value=atr_curr,
                 candle_time=candle_time,
+                confidence_score=score,
             )
 
         return None

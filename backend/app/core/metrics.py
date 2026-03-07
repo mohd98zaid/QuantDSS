@@ -1,0 +1,99 @@
+"""
+Prometheus Metrics — Issue 10 Fix.
+
+Exposes structured metrics for the five key observability dimensions:
+  1. tick_latency_ms      — WebSocket message → candle publish latency
+  2. order_latency_ms     — Signal approval → broker order placement latency
+  3. ws_messages_total    — Raw WebSocket messages received (rate indicator)
+  4. signals_*_total      — Risk engine outcomes by category
+  5. queue_backlog         — Redis Streams pending-message gauge
+
+Endpoint mounted at GET /metrics by prometheus-fastapi-instrumentator.
+
+Usage example:
+    from app.core.metrics import tick_latency_ms, ws_messages_total
+    ws_messages_total.inc()
+    tick_latency_ms.observe(elapsed_ms)
+"""
+try:
+    from prometheus_client import Counter, Gauge, Histogram
+    _PROMETHEUS_AVAILABLE = True
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+
+    # ── Fallback stubs when prometheus_client is not installed ─────
+    class _Noop:  # type: ignore[override]
+        def inc(self, *a, **kw): pass
+        def observe(self, *a, **kw): pass
+        def set(self, *a, **kw): pass
+        def labels(self, *a, **kw): return self
+
+    def Counter(*a, **kw): return _Noop()   # type: ignore[misc]
+    def Gauge(*a, **kw): return _Noop()     # type: ignore[misc]
+    def Histogram(*a, **kw): return _Noop() # type: ignore[misc]
+
+
+# ── Tick / WebSocket ───────────────────────────────────────────────────────────
+ws_messages_total: Counter = Counter(
+    "quantdss_ws_messages_total",
+    "Total WebSocket messages received from broker feed",
+)
+
+tick_latency_ms: Histogram = Histogram(
+    "quantdss_tick_latency_ms",
+    "Time from WebSocket message receipt to candle publish (milliseconds)",
+    buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000],
+)
+
+# ── Order Execution ────────────────────────────────────────────────────────────
+order_latency_ms: Histogram = Histogram(
+    "quantdss_order_latency_ms",
+    "Time from risk-engine APPROVED to broker order placed (milliseconds)",
+    buckets=[10, 50, 100, 250, 500, 1000, 2000, 5000],
+)
+
+orders_placed_total: Counter = Counter(
+    "quantdss_orders_placed_total",
+    "Total orders placed with broker",
+    ["direction"],   # BUY / SELL
+)
+
+orders_cancelled_total: Counter = Counter(
+    "quantdss_orders_cancelled_total",
+    "Total orders cancelled (timeout or operator halt)",
+    ["reason"],      # ORDER_TIMEOUT / OPERATOR_HALT / RECONCILE
+)
+
+# ── Signal Outcomes ────────────────────────────────────────────────────────────
+signals_approved_total: Counter = Counter(
+    "quantdss_signals_approved_total",
+    "Signals approved by the risk engine",
+)
+
+signals_blocked_total: Counter = Counter(
+    "quantdss_signals_blocked_total",
+    "Signals blocked by the risk engine",
+    ["reason"],
+)
+
+signals_skipped_total: Counter = Counter(
+    "quantdss_signals_skipped_total",
+    "Signals skipped by the risk engine",
+    ["reason"],
+)
+
+signals_rejected_scorer_total: Counter = Counter(
+    "quantdss_signals_rejected_scorer_total",
+    "Signals rejected by the signal scorer (< threshold)",
+)
+
+# ── Queue / Infrastructure ─────────────────────────────────────────────────────
+queue_backlog: Gauge = Gauge(
+    "quantdss_redis_stream_backlog",
+    "Number of unacknowledged messages pending in the market:candles Redis Stream",
+)
+
+cpu_pool_active_workers: Gauge = Gauge(
+    "quantdss_cpu_pool_active_workers",
+    "Number of currently active ProcessPoolExecutor workers",
+)

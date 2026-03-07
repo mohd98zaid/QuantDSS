@@ -1,7 +1,7 @@
 """
 Shared FastAPI dependencies — DB session, auth verification.
 """
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,3 +29,15 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return payload
+
+
+async def get_current_user_sse(token: str = Query(..., description="JWT Token via Query string for SSE")) -> dict:
+    """Verify JWT token from query parameter specifically for SSE Streams."""
+    payload = verify_token(token)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+    return payload
+

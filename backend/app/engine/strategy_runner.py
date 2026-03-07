@@ -6,14 +6,31 @@ On each candle close, evaluates all active strategies for the symbol.
 import pandas as pd
 
 from app.core.logging import logger
-from app.engine.base_strategy import BaseStrategy, RawSignal
+from app.engine.base_strategy import BaseStrategy, CandidateSignal
 from app.engine.strategies.ema_crossover import EMACrossoverStrategy
 from app.engine.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
+from app.engine.strategies.orb_vwap import ORBVWAPStrategy
+from app.engine.strategies.volume_expansion import VolumeExpansionStrategy
+from app.engine.strategies.trend_continuation import TrendContinuationStrategy
+from app.engine.strategies.vwap_reclaim import VWAPReclaimStrategy
+from app.engine.strategies.relative_strength_strategy import RelativeStrengthStrategy
+from app.engine.strategies.trend_pullback import TrendPullbackStrategy
+from app.engine.strategies.failed_breakout import FailedBreakoutStrategy
 
-# Registry mapping strategy type to class
+# Registry mapping strategy type key → class
+# FIX #2: added the 3 new strategies that were built but never wired into the live pipeline
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
-    "trend_following": EMACrossoverStrategy,
-    "mean_reversion": RSIMeanReversionStrategy,
+    "trend_following":    EMACrossoverStrategy,
+    "ema_crossover":      EMACrossoverStrategy,
+    "mean_reversion":     RSIMeanReversionStrategy,
+    "rsi_mean_reversion": RSIMeanReversionStrategy,
+    "orb_vwap":           ORBVWAPStrategy,
+    "volume_expansion":   VolumeExpansionStrategy,
+    "trend_continuation": TrendContinuationStrategy,
+    "vwap_reclaim":       VWAPReclaimStrategy,
+    "relative_strength":  RelativeStrengthStrategy,
+    "trend_pullback":     TrendPullbackStrategy,
+    "failed_breakout":    FailedBreakoutStrategy,
 }
 
 
@@ -45,7 +62,7 @@ class StrategyRunner:
 
     def evaluate(
         self, candles: pd.DataFrame, symbol_id: int
-    ) -> list[RawSignal]:
+    ) -> list[CandidateSignal]:
         """
         Evaluate all loaded strategies against the latest candles for a symbol.
 
@@ -54,7 +71,7 @@ class StrategyRunner:
             symbol_id: Database ID of the symbol
 
         Returns:
-            List of RawSignal objects (may be empty)
+            List of CandidateSignal objects (may be empty)
         """
         signals = []
 
@@ -68,7 +85,7 @@ class StrategyRunner:
                         f"{signal.signal_type} @ {signal.entry_price:.2f}"
                     )
             except Exception as e:
-                logger.error(f"Strategy {strategy_id} evaluation error: {e}")
+                logger.exception(f"Strategy {strategy_id} evaluation error: {e}")
 
         return signals
 

@@ -8,6 +8,12 @@ from app.models.signal import Signal
 from app.models.strategy import Strategy, StrategySymbol
 from app.models.symbol import Symbol
 from app.models.trade import Trade
+from app.models.paper_trade import PaperTrade
+from app.models.auto_trade_log import AutoTradeLog
+from app.models.auto_trade_config import AutoTradeConfig
+from app.models.live_trade import LiveTrade
+from app.models.strategy_health import StrategyHealth
+from app.models.strategy_health_log import StrategyHealthLog
 
 __all__ = [
     "Symbol",
@@ -21,4 +27,7 @@ __all__ = [
     "BacktestRun",
     "BacktestTrade",
     "AuditLog",
+    "PaperTrade",
+    "LiveTrade",
+    "StrategyHealth",
 ]

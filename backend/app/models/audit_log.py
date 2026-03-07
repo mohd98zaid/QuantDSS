@@ -1,6 +1,7 @@
 """AuditLog model — Immutable Audit Trail"""
 from sqlalchemy import BigInteger, Column, DateTime, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import JSON
 from sqlalchemy.sql import func
 
 from app.core.database import Base
@@ -14,7 +15,7 @@ class AuditLog(Base):
     event_type = Column(String(50), nullable=False)    # SIGNAL_GENERATED, TRADE_LOGGED, RISK_HALTED, etc.
     entity_type = Column(String(50), nullable=True)    # signals, trades, daily_risk_state
     entity_id = Column(Integer, nullable=True)
-    payload = Column(JSONB, nullable=True)             # Full state snapshot at time of event
+    payload = Column(JSON().with_variant(JSONB, 'postgresql'), nullable=True)             # Full state snapshot at time of event
     source = Column(String(50), default="system")      # system / user
 
     __table_args__ = (

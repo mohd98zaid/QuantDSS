@@ -23,9 +23,8 @@ async def download_and_store():
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with session_factory() as session:
-        # Get all active symbols
         result = await session.execute(
-            select(Symbol).where(Symbol.is_active is True)
+            select(Symbol).where(Symbol.is_active == True)
         )
         symbols = result.scalars().all()
 

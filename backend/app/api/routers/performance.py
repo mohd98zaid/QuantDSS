@@ -78,24 +78,42 @@ async def by_strategy(
     _user: dict = Depends(get_current_user),
 ):
     """Per-strategy performance breakdown from trade journal."""
+    from sqlalchemy.orm import joinedload
+    from app.models.signal import Signal
+    from app.models.strategy import Strategy
+
+    # FIX #5: was grouping by trade.signal_id (1 group per trade).
+    # Now join Trade → Signal → Strategy to aggregate by actual strategy.
     result = await db.execute(
-        select(Trade).where(Trade.is_deleted == False)
+        select(Trade, Signal.strategy_id)
+        .outerjoin(Signal, Trade.signal_id == Signal.id)
+        .where(Trade.is_deleted == False)
     )
-    trades = result.scalars().all()
+    rows = result.all()
 
-    # Group by strategy (via signal_id → strategy)
-    strategy_stats: dict = {}
+    # Fetch strategy names in one query
+    strategy_ids = {r[1] for r in rows if r[1] is not None}
+    strat_names: dict[int, str] = {}
+    if strategy_ids:
+        strat_result = await db.execute(
+            select(Strategy.id, Strategy.name).where(Strategy.id.in_(strategy_ids))
+        )
+        strat_names = {row.id: row.name for row in strat_result.all()}
 
-    for t in trades:
-        key = t.signal_id or 0  # Group by signal association
+    # Group by strategy_id
+    strategy_stats: dict[int | str, dict] = {}
+
+    for trade, strategy_id in rows:
+        key = strategy_id if strategy_id is not None else 0
         if key not in strategy_stats:
             strategy_stats[key] = {
-                "total": 0, "winners": 0, "losers": 0,
-                "gross_pnl": 0.0, "trades": []
+                "strategy_id": key,
+                "strategy_name": strat_names.get(key, "Unlinked"),
+                "total": 0, "winners": 0, "losers": 0, "gross_pnl": 0.0,
             }
         stats = strategy_stats[key]
         stats["total"] += 1
-        pnl = float(t.net_pnl or 0)
+        pnl = float(trade.net_pnl or 0)
         stats["gross_pnl"] += pnl
         if pnl > 0:
             stats["winners"] += 1
@@ -104,10 +122,12 @@ async def by_strategy(
 
     return [
         {
-            "strategy_id": k,
+            "strategy_id": v["strategy_id"],
+            "strategy_name": v["strategy_name"],
             "total_trades": v["total"],
             "win_rate": round(v["winners"] / v["total"] * 100, 1) if v["total"] > 0 else 0,
             "net_pnl": round(v["gross_pnl"], 2),
         }
-        for k, v in strategy_stats.items()
+        for v in sorted(strategy_stats.values(), key=lambda x: abs(x["gross_pnl"]), reverse=True)
     ]
+

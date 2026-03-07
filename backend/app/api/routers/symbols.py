@@ -39,12 +39,14 @@ async def add_symbol(
             detail=f"Symbol {data.trading_symbol} already exists",
         )
 
-    # Check watchlist max (20 symbols in MVP)
-    count_result = await db.execute(select(Symbol).where(Symbol.is_active is True))
-    if len(count_result.scalars().all()) >= 20:
+    # Check watchlist max (200 symbols)
+    count_result = await db.execute(
+        select(Symbol).where(Symbol.is_active == True)  # noqa: E712
+    )
+    if len(count_result.scalars().all()) >= 200:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum of 20 symbols allowed in MVP",
+            detail="Maximum of 200 symbols allowed",
         )
 
     symbol = Symbol(
@@ -57,18 +59,16 @@ async def add_symbol(
     return symbol
 
 
-@router.delete("/symbols/{symbol_id}")
+@router.delete("/symbols/{symbol_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_symbol(
     symbol_id: int,
     db: AsyncSession = Depends(get_session),
     _user: dict = Depends(get_current_user),
 ):
-    """Soft-deactivate a symbol from the watchlist."""
+    """Hard-delete a symbol from the watchlist."""
     result = await db.execute(select(Symbol).where(Symbol.id == symbol_id))
     symbol = result.scalar_one_or_none()
     if not symbol:
         raise HTTPException(status_code=404, detail="Symbol not found")
 
-    symbol.is_active = False
-    await db.flush()
-    return {"message": "Symbol deactivated"}
+    await db.delete(symbol)

@@ -46,6 +46,10 @@ async def start_market_session():
     """Connect broker + warm up strategies — runs at 09:14 IST."""
     logger.info("Starting market session — connecting broker and loading strategies")
     from app.ingestion.broker_manager import broker_manager
+    # FIX #6: skip re-init if already connected — avoids killing the recovery task
+    if broker_manager.active_broker and broker_manager.active_broker.is_connected:
+        logger.info("start_market_session: broker already connected — skipping re-init")
+        return
     await broker_manager.initialize_session()
 
 
@@ -115,8 +119,65 @@ async def send_eod_summary():
 
 
 async def check_broker_health():
-    """Verify broker WebSocket connection — runs every 5 min during market hours."""
-    logger.debug("Checking broker health")
+    """
+    Verify broker connection every 5 min during market hours.
+    FIX #9/#13: was a no-op. Now checks is_connected flag and triggers
+    re-initialization if the active broker is disconnected — without making
+    a redundant HTTP call (the recovery task handles Upstox pings).
+    """
+    from app.ingestion.broker_manager import broker_manager
+    active = broker_manager.active_broker
+    if active is None:
+        logger.warning("check_broker_health: no broker configured — attempting init")
+        await broker_manager.initialize_session()
+    elif not active.is_connected:
+        logger.warning(
+            f"check_broker_health: {active.name} reports DISCONNECTED — re-initializing"
+        )
+        await broker_manager.initialize_session()
+    else:
+        logger.debug(f"check_broker_health: {active.name} is connected ✓")
+
+
+async def order_timeout_check():
+    """
+    Issue 4 Fix: Cancel PENDING live orders older than 5 minutes.
+    Runs every 2 minutes during market hours.
+    """
+    from datetime import datetime, timezone, timedelta
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(IST)
+    h, m = now_ist.hour, now_ist.minute
+    in_market_hours = (h > 9 or (h == 9 and m >= 15)) and (h < 15 or (h == 15 and m <= 30))
+    if not in_market_hours or now_ist.weekday() >= 5:
+        return
+    from app.core.database import async_session_factory
+    from app.engine.execution_manager import ExecutionManager
+    try:
+        async with async_session_factory() as db:
+            mgr = ExecutionManager(db)
+            cancelled = await mgr.cancel_stale_pending_orders(timeout_minutes=5)
+            if cancelled:
+                logger.info(f"Scheduler: cancelled {cancelled} timed-out PENDING order(s)")
+    except Exception as e:
+        logger.error(f"order_timeout_check error: {e}")
+
+
+async def order_reconciliation_check():
+    """
+    Issue 7b Fix: Periodic order reconciliation for missed webhooks.
+    Queries the broker for all PENDING/PARTIALLY_FILLED trades
+    and syncs their status. Runs every 5 minutes.
+    """
+    from app.core.database import async_session_factory
+    from app.engine.execution_manager import ExecutionManager
+    try:
+        async with async_session_factory() as db:
+            mgr = ExecutionManager(db)
+            await mgr.reconcile_orders()
+    except Exception as e:
+        logger.error(f"order_reconciliation_check error: {e}")
 
 
 def setup_scheduler():
@@ -126,6 +187,21 @@ def setup_scheduler():
 
     # Market session start — connect broker, warm up strategies
     scheduler.add_job(start_market_session, "cron", hour=9, minute=14, id="start_session")
+
+    # Fix C-02: Reset candle aggregator session at 09:15 IST (market open)
+    async def _reset_candle_session():
+        try:
+            from app.ingestion.candle_aggregator import candle_aggregator
+            candle_aggregator.reset_session()
+            logger.info("Scheduler: Candle aggregator session reset for new day")
+        except Exception as e:
+            logger.error(f"Scheduler: candle session reset failed: {e}")
+
+    scheduler.add_job(_reset_candle_session, "cron", hour=9, minute=15, id="candle_session_reset")
+
+    # Fix C-02: Auto Square-Off at 15:15 IST — close all open positions (NSE intraday rule)
+    from app.engine.auto_trader_engine import auto_square_off
+    scheduler.add_job(auto_square_off, "cron", hour=15, minute=15, id="auto_square_off")
 
     # Market session end — stop signal generation
     scheduler.add_job(stop_market_session, "cron", hour=15, minute=30, id="stop_session")
@@ -141,4 +217,52 @@ def setup_scheduler():
         id="broker_health",
     )
 
+    # Paper Trading Monitor — now runs every 15 seconds for faster SL/TP detection
+    from app.engine.paper_monitor import check_paper_trades
+    scheduler.add_job(
+        check_paper_trades,
+        "interval",
+        seconds=15,
+        id="paper_trade_monitor"
+    )
+
+    # Auto-Trader Engine — scan watchlist and open positions automatically
+    from app.engine.auto_trader_engine import run_auto_trader
+    scheduler.add_job(
+        run_auto_trader,
+        "interval",
+        minutes=5,
+        id="auto_trader",
+        max_instances=1,         # never run two scans at once
+    )
+
+    # Regime Auto-Update — detect market regime and write to RiskConfig every 5 min
+    from app.engine.regime_scheduler import update_regime_in_db
+    scheduler.add_job(
+        update_regime_in_db,
+        "interval",
+        minutes=5,
+        id="regime_update",
+    )
+
+    # Order timeout check — cancel PENDING orders older than 5 min
+    scheduler.add_job(
+        order_timeout_check,
+        "interval",
+        minutes=2,
+        id="order_timeout",
+    )
+
+    # Order reconciliation — sync missed webhooks every 5 min
+    scheduler.add_job(
+        order_reconciliation_check,
+        "interval",
+        minutes=5,
+        id="order_reconciliation",
+    )
+
+    # Ensure auto-trader DB tables exist
+    from app.models import auto_trade_config, auto_trade_log  # noqa: F401
+
     logger.info("Scheduler configured with market hour jobs (IST timezone)")
+

@@ -15,8 +15,9 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo Starting Docker stack in the background...
-docker-compose up -d
+echo Building and starting Docker stack...
+docker compose build frontend
+docker compose up -d
 
 echo.
 echo ========================================

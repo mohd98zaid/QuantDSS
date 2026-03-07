@@ -94,7 +94,7 @@ async def create_trade(
         },
     )
     db.add(audit)
-    await db.flush()
+    await db.commit()  # FIX #3: was flush() — trade + audit were never persisted
     await db.refresh(trade)
     return trade
 
@@ -126,7 +126,7 @@ async def update_trade(
             trade.gross_pnl = (float(trade.entry_price) - float(trade.exit_price)) * trade.quantity
         trade.net_pnl = float(trade.gross_pnl) - float(trade.brokerage or 0)
 
-    await db.flush()
+    await db.commit()  # FIX #3: was flush() — update was never persisted
     await db.refresh(trade)
     return trade
 
@@ -146,7 +146,7 @@ async def delete_trade(
         raise HTTPException(status_code=404, detail="Trade not found")
 
     trade.is_deleted = True
-    await db.flush()
+    await db.commit()  # FIX #3: was flush() — soft-delete was never persisted
     return {"message": "Trade deleted"}
 
 

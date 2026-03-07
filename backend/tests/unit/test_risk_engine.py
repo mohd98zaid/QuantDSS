@@ -12,9 +12,11 @@ from app.engine.risk_engine import (
     DailyLossCircuitBreaker,
     MaxConcurrentPositions,
     MaxPositionSizeCap,
+    MaxSignalsPerStockPerDay,
     Portfolio,
     PositionSizer,
     RiskEngine,
+    SignalTimeGateFilter,
     VolatilityFilter,
 )
 
@@ -32,6 +34,13 @@ class FakeRiskConfig:
     max_atr_pct: float = 0.030
     max_position_pct: float = 0.20
     max_concurrent_positions: int = 2
+    # Time-gate: open all day so tests pass regardless of when CI runs
+    signal_start_hour: int = 0
+    signal_start_minute: int = 0
+    signal_end_hour: int = 23
+    signal_end_minute: int = 59
+    # Per-stock daily signal limit: very high so it never interferes with unit checks
+    max_signals_per_stock: int = 999
 
 
 @dataclass
@@ -53,6 +62,7 @@ def make_signal(
     return RawSignal(
         symbol_id=1,
         strategy_id=1,
+        strategy_name="TestStrategy",
         signal_type=signal_type,
         entry_price=entry_price,
         stop_loss=stop_loss,
@@ -283,6 +293,7 @@ class TestRiskEngineIntegration:
         """Happy path — signal passes all 7 rules."""
         config = FakeRiskConfig()
         engine = RiskEngine(config)
+        engine.load_adv({"1": 1000000})
         state = FakeDailyRiskState(realised_pnl=0, last_signal_time=None)
         portfolio = Portfolio(current_balance=100000, peak_balance=100000, open_positions=0)
         signal = make_signal(entry_price=100, stop_loss=98, target_price=104, atr_value=2.0)
@@ -336,6 +347,7 @@ class TestRiskEngineIntegration:
         """When raw qty exceeds cap, it should be adjusted down but still approved."""
         config = FakeRiskConfig()
         engine = RiskEngine(config)
+        engine.load_adv({"1": 1000000})
         state = FakeDailyRiskState()
         portfolio = Portfolio(current_balance=100000, peak_balance=100000, open_positions=0)
         # Very tight stop → large qty → should hit position cap

@@ -1,57 +1,80 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+@layer base {
+  :root {
+    --bg-primary: #020617; /* Slate 950 */
+    --bg-secondary: #0f172a; /* Slate 900 */
+    --bg-card: rgba(15, 23, 42, 0.6);
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --border: rgba(30, 41, 59, 0.8);
+    --accent-green: #10b981;
+    --accent-red: #ef4444;
+    --accent-blue: #3b82f6;
+    --accent-purple: #8b5cf6;
+  }
 
-:root {
-  --bg-primary: #030712;
-  --bg-secondary: #111827;
-  --bg-card: #1f2937;
-  --text-primary: #f9fafb;
-  --text-secondary: #9ca3af;
-  --border: #374151;
-  --accent-green: #10b981;
-  --accent-red: #ef4444;
-  --accent-blue: #3b82f6;
-}
-
-body {
-  background-color: var(--bg-primary);
-  color: var(--text-primary);
-  font-family: "Inter", system-ui, sans-serif;
-}
-
-/* Trading-specific utilities */
-.text-profit {
-  color: var(--accent-green);
-}
-.text-loss {
-  color: var(--accent-red);
-}
-.bg-profit {
-  background-color: rgba(16, 185, 129, 0.1);
-}
-.bg-loss {
-  background-color: rgba(239, 68, 68, 0.1);
+  body {
+    background-color: var(--bg-primary);
+    background-image:
+      radial-gradient(at 0% 0%, rgba(15, 23, 42, 1) 0px, transparent 50%),
+      radial-gradient(at 100% 0%, rgba(30, 58, 138, 0.15) 0px, transparent 50%);
+    background-attachment: fixed;
+    color: var(--text-primary);
+    font-family: "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
 }
 
-.font-mono-nums {
-  font-family: "JetBrains Mono", "Fira Code", monospace;
-  font-variant-numeric: tabular-nums;
+@layer utilities {
+  .font-mono-nums {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .font-outfit {
+    font-family: "Outfit", "Inter", sans-serif;
+  }
+
+  /* Glassmorphism utilities */
+  .glass-panel {
+    @apply bg-slate-900/60 backdrop-blur-md border border-slate-800/80 shadow-xl;
+  }
+
+  .glass-card {
+    @apply bg-slate-900/40 backdrop-blur-sm border border-slate-800/60 shadow-lg hover:border-slate-700/80 transition-all duration-300;
+  }
+
+  .text-glow {
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.3);
+  }
+
+  .text-glow-green {
+    text-shadow: 0 0 12px rgba(16, 185, 129, 0.4);
+  }
+
+  .text-glow-red {
+    text-shadow: 0 0 12px rgba(239, 68, 68, 0.4);
+  }
 }
 
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 3px;
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+  background: #475569;
 }

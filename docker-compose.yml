@@ -1,5 +1,3 @@
-
-
 services:
   postgres:
     image: timescale/timescaledb:latest-pg15
@@ -32,6 +30,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── API Server ────────────────────────────────────────────────────────────
   backend:
     build: ./backend
     restart: unless-stopped
@@ -47,28 +46,104 @@ services:
     volumes:
       - ./backend:/app
 
-  celery-worker:
-    build: ./backend
+  # ── Signal Engine Worker ──────────────────────────────────────────────────
+  signal-engine-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
     restart: unless-stopped
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://quant:${DB_PASSWORD}@postgres:5432/quantdb
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    command: ["python", "-m", "app.workers.signal_engine_worker"]
     depends_on:
-      - backend
-      - redis
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
+  # ── Risk Engine Worker ────────────────────────────────────────────────────
+  risk-engine-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://quant:${DB_PASSWORD}@postgres:5432/quantdb
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    command: ["python", "-m", "app.workers.risk_engine_worker"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── AutoTrader Worker ─────────────────────────────────────────────────────
+  autotrader-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://quant:${DB_PASSWORD}@postgres:5432/quantdb
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    command: ["python", "-m", "app.workers.autotrader_worker"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Trade Monitor Worker ──────────────────────────────────────────────────
+  trade-monitor-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://quant:${DB_PASSWORD}@postgres:5432/quantdb
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    command: ["python", "-m", "app.workers.trade_monitor_worker"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
   frontend:
     build: ./frontend
     restart: unless-stopped
-    environment:
-      NEXT_PUBLIC_API_URL: http://localhost/api
     ports:
       - "3000:3000"
     depends_on:
       - backend
 
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
     restart: unless-stopped

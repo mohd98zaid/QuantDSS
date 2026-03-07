@@ -1,37 +1,51 @@
 """Backtest router — Run backtests and view results."""
 
+import asyncio
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_session
+from app.core.rate_limit import limiter
 from app.engine.backtest_engine import BacktestEngine
 from app.engine.risk_engine import RiskEngine
 from app.engine.strategies.ema_crossover import EMACrossoverStrategy
 from app.engine.strategies.rsi_mean_reversion import RSIMeanReversionStrategy
+from app.engine.strategies.orb_vwap import ORBVWAPStrategy
+from app.engine.strategies.volume_expansion import VolumeExpansionStrategy
+from app.engine.strategies.trend_continuation import TrendContinuationStrategy
 from app.models.backtest_run import BacktestRun
 from app.models.backtest_run import BacktestTrade as BacktestTradeModel
 from app.models.candle import Candle
 from app.models.strategy import Strategy
 from app.models.symbol import Symbol
 from app.schemas.backtest import BacktestCreate, BacktestResponse
+from app.core.logging import logger
 
 router = APIRouter()
 
+# FIX #8: all 5 strategies wired into backtest (previously only 2)
 STRATEGY_MAP = {
-    "trend_following": EMACrossoverStrategy,
-    "mean_reversion": RSIMeanReversionStrategy,
+    "trend_following":    EMACrossoverStrategy,
+    "ema_crossover":      EMACrossoverStrategy,
+    "mean_reversion":     RSIMeanReversionStrategy,
+    "rsi_mean_reversion": RSIMeanReversionStrategy,
+    "orb_vwap":           ORBVWAPStrategy,
+    "volume_expansion":   VolumeExpansionStrategy,
+    "trend_continuation": TrendContinuationStrategy,
 }
 
 
 @router.post("/backtest/run", response_model=BacktestResponse)
+@limiter.limit("5/minute")   # FIX #8: rate limit to prevent event-loop saturation
 async def run_backtest(
+    request: Request,          # required by slowapi limiter
     data: BacktestCreate,
     db: AsyncSession = Depends(get_session),
     _user: dict = Depends(get_current_user),
 ):
-    """Run a backtest and store results."""
+    """Run a backtest and store results (max 5 per minute)."""
     # Get strategy
     result = await db.execute(select(Strategy).where(Strategy.id == data.strategy_id))
     strategy_model = result.scalar_one_or_none()
@@ -60,20 +74,46 @@ async def run_backtest(
     candles = candle_result.scalars().all()
 
     if len(candles) < 60:
+        # Auto-seed via Yahoo Finance — no API token required
+        logger.info(f"Backtest: insufficient candles ({len(candles)}) for {symbol_model.trading_symbol}/{data.timeframe} — auto-seeding via Yahoo Finance")
+        try:
+            import asyncio
+            from app.api.routers.market_data import _fetch_yfinance, _yf_to_db_rows, _upsert_candles
+            yf_candles = await asyncio.get_event_loop().run_in_executor(
+                None, _fetch_yfinance, symbol_model.trading_symbol, data.timeframe or "1day"
+            )
+            yf_rows = _yf_to_db_rows(yf_candles, symbol_model, data.timeframe or "1day")
+            seeded = await _upsert_candles(db, yf_rows)
+            logger.info(f"Backtest auto-seed: inserted {seeded} candles for {symbol_model.trading_symbol}")
+            # Re-query
+            candle_result2 = await db.execute(candle_query)
+            candles = candle_result2.scalars().all()
+        except Exception as seed_exc:
+            logger.warning(f"Backtest auto-seed failed: {seed_exc}")
+
+    if len(candles) < 60:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient candle data: {len(candles)} (need at least 60)"
+            detail=f"Insufficient candle data: {len(candles)} (need at least 60). Go to Market Data page and seed data for this symbol first."
         )
 
     # Convert to DataFrame
-    df = pd.DataFrame([{
-        "time": c.time,
-        "open": float(c.open),
-        "high": float(c.high),
-        "low": float(c.low),
-        "close": float(c.close),
-        "volume": c.volume,
-    } for c in candles])
+    try:
+        df = pd.DataFrame([{
+            "time": c.time,
+            "open": float(c.open),
+            "high": float(c.high),
+            "low": float(c.low),
+            "close": float(c.close),
+            "volume": c.volume,
+        } for c in candles])
+        df["time"] = pd.to_datetime(df["time"])
+    except Exception as e:
+        logger.error(f"Backtest Pandas processing error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process historical data for backtesting."
+        )
 
     # Create strategy instance
     strategy_cls = STRATEGY_MAP.get(strategy_model.type)
@@ -114,7 +154,6 @@ async def run_backtest(
         max_drawdown_pct=bt_result.max_drawdown_pct,
         sharpe_ratio=bt_result.sharpe_ratio,
         profit_factor=bt_result.profit_factor,
-        parameters=params,
     )
     db.add(run)
     await db.flush()
@@ -137,24 +176,33 @@ async def run_backtest(
     await db.flush()
     await db.refresh(run)
 
-    return BacktestResponse(
-        id=run.id,
-        strategy_name=strategy_model.name,
-        symbol=symbol_model.trading_symbol,
-        timeframe=data.timeframe or "1d",
-        start_date=str(bt_result.start_date),
-        end_date=str(bt_result.end_date),
-        initial_capital=bt_result.initial_balance,
-        final_capital=bt_result.final_balance,
-        total_return_pct=bt_result.total_return_pct,
-        total_trades=bt_result.total_trades,
-        winning_trades=bt_result.winning_trades,
-        losing_trades=bt_result.losing_trades,
-        win_rate=bt_result.win_rate,
-        max_drawdown_pct=bt_result.max_drawdown_pct,
-        sharpe_ratio=bt_result.sharpe_ratio,
-        profit_factor=bt_result.profit_factor,
-    )
+    print("Creating BacktestResponse...")
+    try:
+        response = BacktestResponse(
+            id=run.id,
+            strategy_name=strategy_model.name,
+            symbol=symbol_model.trading_symbol,
+            timeframe=data.timeframe or "1d",
+            start_date=str(bt_result.start_date),
+            end_date=str(bt_result.end_date),
+            initial_capital=bt_result.initial_balance,
+            final_capital=bt_result.final_balance,
+            total_return_pct=bt_result.total_return_pct,
+            total_trades=bt_result.total_trades,
+            winning_trades=bt_result.winning_trades,
+            losing_trades=bt_result.losing_trades,
+            win_rate=bt_result.win_rate,
+            max_drawdown_pct=bt_result.max_drawdown_pct,
+            sharpe_ratio=bt_result.sharpe_ratio,
+            profit_factor=bt_result.profit_factor,
+        )
+        print("Response created successfully!")
+        return response
+    except Exception as e:
+        print(f"Error creating response: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Response serialization error: {e}")
 
 
 @router.get("/backtest/runs")

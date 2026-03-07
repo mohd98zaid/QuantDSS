@@ -1,7 +1,5 @@
 import type { Metadata } from 'next'
 import './globals.css'
-import { Sidebar } from '@/components/layout/Sidebar'
-import { Header } from '@/components/layout/Header'
 
 export const metadata: Metadata = {
   title: 'QuantDSS — Trading Decision Support',
@@ -14,20 +12,9 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className="dark">
-      <body className="bg-surface-950 text-white min-h-screen">
-        <div className="flex h-screen overflow-hidden">
-          {/* Sidebar */}
-          <Sidebar />
-
-          {/* Main content area */}
-          <div className="flex flex-col flex-1 overflow-hidden">
-            <Header />
-            <main className="flex-1 overflow-y-auto p-6">
-              {children}
-            </main>
-          </div>
-        </div>
+    <html lang="en" className="dark scroll-smooth">
+      <body className="text-white min-h-screen font-sans selection:bg-blue-500/30">
+        {children}
       </body>
     </html>
   )
