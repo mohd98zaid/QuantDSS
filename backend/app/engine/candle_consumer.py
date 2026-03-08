@@ -36,7 +36,7 @@ class CandleConsumer:
     STREAM_KEY = "market:candles"
     GROUP_NAME = "signal_pipeline_group"
     CONSUMER_NAME = "candle_consumer_1"
-    MAX_BUFFER_SIZE = 200  # max candles per symbol to retain
+    MAX_BUFFER_SIZE = 300  # max candles per symbol to retain
 
     def __init__(self):
         self._task: asyncio.Task | None = None
@@ -232,16 +232,13 @@ class CandleConsumer:
 
             fed_count = 0
             for sig in signals:
-                # Check for duplicates before feeding into the pool
-                if signal_dedup.is_duplicate(sig.symbol_id, sig.strategy_id, sig.candle_time):
+                # Check for duplicates before feeding into the pool (Implicitly records if it wasn't a duplicate)
+                if await signal_dedup.is_duplicate(sig.symbol_id, sig.strategy_id, sig.candle_time):
                     SignalTracer.trace_drop(
                         trace_id, "DEDUP_CHECK", symbol,
                         f"Duplicate {sig.strategy_name} suppressed"
                     )
                     continue
-
-                # Record this signal to prevent future duplicates
-                signal_dedup.record(sig.symbol_id, sig.strategy_id, sig.candle_time)
 
                 # Attach symbol name for downstream layers
                 sig.metadata["symbol_name"] = symbol
@@ -261,9 +258,6 @@ class CandleConsumer:
                     f"CandleConsumer: {fed_count} signal(s) from {symbol} "
                     f"fed into intelligence pipeline (trace={trace_id})"
                 )
-
-            # Periodic dedup cleanup (every ~100 processed messages)
-            signal_dedup.cleanup()
 
         except Exception as e:
             logger.exception(f"CandleConsumer: strategy evaluation failed for {symbol}: {e}")

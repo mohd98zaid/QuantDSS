@@ -55,3 +55,16 @@ APScheduler>=3.10.0
 
 # Task Queue
 celery>=5.3.0
+
+# Kafka
+aiokafka>=0.10.0
+
+# Performance
+polars>=1.0.0
+
+# Monitoring
+prometheus-fastapi-instrumentator>=7.0.0
+prometheus-client>=0.20.0
+
+# WebSocket client
+websockets>=12.0

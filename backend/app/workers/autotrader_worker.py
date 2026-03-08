@@ -13,8 +13,9 @@ import asyncio
 import json
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import async_session_factory
 from app.core.logging import logger
@@ -75,65 +76,92 @@ class AutoTraderWorker(WorkerBase):
 
         is_replay = data.get("is_replay", "").lower() in ("true", "1", "yes")
 
-        # Check market hours — bypass for replay sessions so historical data can be tested
-        if not is_replay and not _is_market_hours():
-            logger.info(f"[{self.NAME}] Outside market hours — skipping {symbol_name} {signal_type}")
+        # Idempotency check: hash unique traits deterministically (Fix Group 2)
+        signal_hash = f"{symbol_name}_{signal_type}_{contributing_strategies}_{candle_time_str}"
+        idempotency_key = f"executed_signal:{signal_hash}"
+        
+        from app.core.redis import redis_client
+        is_new = await redis_client.set(idempotency_key, "1", ex=900, nx=True)
+        if not is_new:
+            logger.info(f"[{self.NAME}] Idempotency skip (already executed): {signal_hash}")
             return
-        if is_replay:
-            logger.info(f"[{self.NAME}] 🔄 Replay signal — bypassing market hours check for {symbol_name} {signal_type}")
 
-        async with async_session_factory() as db:
-            # Load auto-trade configuration
-            result = await db.execute(select(AutoTradeConfig).limit(1))
-            cfg = result.scalar_one_or_none()
+        # Fix Group 5: Extract reservation values to release them after execution attempt
+        risk_amount = float(data.get("risk_amount", 0))
+        quantity = int(float(data.get("quantity", 0)))
+        entry_price = float(data.get("entry_price", 0))
+        notional = quantity * entry_price
 
-            if cfg is None or not cfg.enabled:
-                logger.info(f"[{self.NAME}] AutoTrader disabled — skipping {symbol_name}")
+        try:
+            # Check market hours — bypass for replay sessions so historical data can be tested
+            if not is_replay and not _is_market_hours():
+                logger.info(f"[{self.NAME}] Outside market hours — skipping {symbol_name} {signal_type}")
                 return
+            if is_replay:
+                logger.info(f"[{self.NAME}] 🔄 Replay signal — bypassing market hours check for {symbol_name} {signal_type}")
 
-            mode = getattr(cfg, "mode", "paper")
+            async with async_session_factory() as db:
+                # Load auto-trade configuration
+                result = await db.execute(select(AutoTradeConfig).limit(1))
+                cfg = result.scalar_one_or_none()
 
-            if mode == "paper":
-                await self._execute_paper_trade(
-                    db=db,
-                    cfg=cfg,
-                    symbol_name=symbol_name,
-                    signal_type=signal_type,
-                    entry_price=entry_price,
-                    stop_loss=stop_loss,
-                    target_price=target_price,
-                    quantity=quantity,
-                    risk_amount=risk_amount,
-                    strategy=contributing_strategies,
-                    quality_score=quality_score,
-                    symbol_id=symbol_id,
-                )
-            else:
-                await self._execute_live_trade(
-                    db=db,
-                    cfg=cfg,
-                    symbol_name=symbol_name,
-                    signal_type=signal_type,
-                    entry_price=entry_price,
-                    stop_loss=stop_loss,
-                    target_price=target_price,
-                    quantity=quantity,
-                    risk_amount=risk_amount,
-                    strategy=contributing_strategies,
-                    symbol_id=symbol_id,
-                )
+                if cfg is None or not cfg.enabled:
+                    logger.info(f"[{self.NAME}] AutoTrader disabled — skipping {symbol_name}")
+                    return
 
-        # Publish executed signal
-        executed_message = {
-            "trade_id": "",  # Filled after DB insert
-            "symbol": symbol_name,
-            "signal_type": signal_type,
-            "entry_price": str(entry_price),
-            "quantity": str(quantity),
-            "mode": mode,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        await publish_to_stream(STREAM_SIGNALS_EXECUTED, executed_message)
+                mode = getattr(cfg, "mode", "paper")
+
+                if mode == "paper":
+                    await self._execute_paper_trade(
+                        db=db,
+                        cfg=cfg,
+                        symbol_name=symbol_name,
+                        signal_type=signal_type,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss,
+                        target_price=target_price,
+                        quantity=quantity,
+                        risk_amount=risk_amount,
+                        strategy=contributing_strategies,
+                        quality_score=quality_score,
+                        symbol_id=symbol_id,
+                    )
+                else:
+                    await self._execute_live_trade(
+                        db=db,
+                        cfg=cfg,
+                        symbol_name=symbol_name,
+                        signal_type=signal_type,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss,
+                        target_price=target_price,
+                        quantity=quantity,
+                        risk_amount=risk_amount,
+                        strategy=contributing_strategies,
+                        symbol_id=symbol_id,
+                    )
+
+            # Publish executed signal
+            executed_message = {
+                "trade_id": "",  # Filled after DB insert
+                "symbol": symbol_name,
+                "signal_type": signal_type,
+                "entry_price": str(entry_price),
+                "quantity": str(quantity),
+                "mode": mode,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            await publish_to_stream(STREAM_SIGNALS_EXECUTED, executed_message)
+            
+        finally:
+            # Fix Group 5: Release risk reservations
+            try:
+                from app.core.redis import redis_client
+                trace_id = data.get("_trace_id")
+                if trace_id:
+                    await redis_client.delete(f"risk_reservation:{trace_id}")
+            except Exception as e:
+                logger.error(f"[{self.NAME}] Failed to release risk reservations: {e}")
 
     # ── Paper Trade Execution ────────────────────────────────────────────────
 
@@ -154,13 +182,12 @@ class AutoTraderWorker(WorkerBase):
     ):
         """Execute a paper trade — write to paper_trades table."""
         # Check for duplicate open trades
-        from sqlalchemy import and_
         existing = await db.execute(
             select(PaperTrade).where(
                 and_(
                     PaperTrade.symbol == symbol_name,
                     PaperTrade.status == "OPEN",
-                    PaperTrade.signal == signal_type,
+                    PaperTrade.direction == signal_type,
                 )
             ).limit(1)
         )
@@ -175,14 +202,13 @@ class AutoTraderWorker(WorkerBase):
 
         trade = PaperTrade(
             symbol=symbol_name,
-            signal=signal_type,
+            direction=signal_type,
             entry_price=entry_price,
             stop_loss=stop_loss,
             target_price=target_price,
             quantity=quantity,
-            strategy=strategy if isinstance(strategy, str) else json.dumps(strategy),
             status="OPEN",
-            entry_time=datetime.now(timezone.utc),
+            # removed strategy and entry_time as they don't exist in model
         )
 
         db.add(trade)
@@ -222,16 +248,14 @@ class AutoTraderWorker(WorkerBase):
             sym = result.scalar_one_or_none()
             instrument_key = sym.instrument_key if sym else ""
 
-            trade = await mgr.place_entry_order(
+            trade = await mgr.place_order(
                 symbol=symbol_name,
-                signal_type=signal_type,
-                entry_price=entry_price,
+                instrument_key=instrument_key,
+                direction=signal_type,
+                quantity=quantity,
+                signal_price=entry_price,
                 stop_loss=stop_loss,
                 target_price=target_price,
-                quantity=quantity,
-                risk_amount=risk_amount,
-                instrument_key=instrument_key,
-                strategy=strategy if isinstance(strategy, str) else json.dumps(strategy),
             )
 
             if trade:

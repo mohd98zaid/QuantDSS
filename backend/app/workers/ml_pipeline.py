@@ -56,7 +56,7 @@ class MLPipeline(WorkerBase):
                 trade_result = await db.execute(
                     select(PaperTrade).where(
                         and_(
-                            PaperTrade.signal == sig.signal_type,
+                            PaperTrade.direction == sig.signal_type,
                             PaperTrade.entry_price == sig.entry_price,
                             PaperTrade.status == "CLOSED",
                         )

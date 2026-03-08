@@ -56,9 +56,11 @@ class TimeFilterLayer:
 
         # Convert to IST if needed
         if isinstance(sig_time, datetime):
-            if sig_time.tzinfo is not None:
-                IST = timezone(timedelta(hours=5, minutes=30))
-                sig_time = sig_time.astimezone(IST)
+            # Fix Group 7: Timezone Consistency
+            if sig_time.tzinfo is None:
+                sig_time = sig_time.replace(tzinfo=timezone.utc)
+            IST = timezone(timedelta(hours=5, minutes=30))
+            sig_time = sig_time.astimezone(IST)
             t = sig_time.time()
         else:
             logger.warning(f"TimeFilter: timestamp is not a datetime object: {type(sig_time)}")

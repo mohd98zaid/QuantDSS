@@ -28,6 +28,7 @@ from app.core.streams import (
 )
 from app.engine.base_strategy import CandidateSignal
 from app.engine.consolidation_layer import ConsolidatedSignal
+from app.engine.sharding import ShardManager
 from app.workers.base import WorkerBase
 
 
@@ -39,13 +40,19 @@ class SignalEngineWorker(WorkerBase):
 
     NAME = "signal-engine-worker"
     CONSUMER_GROUP = "signal_engine_group"
-    CONSUMER_NAME = "signal_engine_1"
-    MAX_BUFFER_SIZE = 200
+    MAX_BUFFER_SIZE = 300
 
     def __init__(self):
         super().__init__()
         self._buffers: dict[str, list[dict]] = defaultdict(list)
         self._strategy_runner = None
+        # Shard-aware consumer naming
+        from app.core.config import settings
+        self._shard = ShardManager(
+            worker_id=settings.signal_worker_id,
+            total_workers=settings.signal_worker_total,
+        )
+        self.CONSUMER_NAME = f"signal_engine_{settings.signal_worker_id}"
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -166,6 +173,10 @@ class SignalEngineWorker(WorkerBase):
         if not symbol:
             return
 
+        # Shard check: skip symbols not owned by this worker
+        if not self._shard.owns(symbol):
+            return
+
         # Parse candle — handle both raw field format and nested JSON 'data' field
         raw_data = data.get("data")
         if raw_data:
@@ -188,8 +199,8 @@ class SignalEngineWorker(WorkerBase):
         if len(self._buffers[symbol]) > self.MAX_BUFFER_SIZE:
             self._buffers[symbol] = self._buffers[symbol][-self.MAX_BUFFER_SIZE:]
 
-        # Need minimum candles for strategy evaluation
-        if len(self._buffers[symbol]) < 30:
+        # Need minimum candles for strategy evaluation (Fix Group 6)
+        if len(self._buffers[symbol]) < 120:
             return
 
         # Build DataFrame

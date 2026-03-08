@@ -96,7 +96,7 @@ class BaseStrategy(ABC):
     @property
     def min_candles_required(self) -> int:
         """Minimum number of candles needed for reliable indicator computation."""
-        return 100  # Default: 100 candles
+        return 500  # Default: 500 candles (Fix 4: Warmup correction)
 
 
 # ── Backward-compat alias ──────────────────────────────────────────

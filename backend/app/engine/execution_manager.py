@@ -37,6 +37,7 @@ from app.core.notifier import notifier
 from app.models.live_trade import LiveTrade
 from app.ingestion.upstox_http import UpstoxHTTPClient
 from app.engine.risk_engine import increment_api_error, reset_api_error
+from app.models.order_event import OrderEvent
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -83,6 +84,26 @@ class ExecutionManager:
             "Authorization": f"Bearer {self._token}",
         }
 
+    async def _emit_order_event(
+        self,
+        order_id: str,
+        event_type: str,
+        payload: dict | None = None,
+        source: str = "execution_manager",
+    ) -> None:
+        """Record an order lifecycle event in the audit table."""
+        try:
+            event = OrderEvent(
+                order_id=order_id,
+                event_type=event_type,
+                payload_json=payload or {},
+                source=source,
+            )
+            self.db.add(event)
+            await self.db.flush()
+        except Exception as e:
+            logger.debug(f"OrderEvent audit write failed (non-critical): {e}")
+
     async def place_order(
         self,
         symbol: str,
@@ -105,6 +126,18 @@ class ExecutionManager:
             logger.error(f"ExecutionManager: {symbol} Invalid quantity {quantity}")
             return None
 
+        # Fix Group 8: Execution Drift Protection
+        from app.ingestion.websocket_manager import market_data_cache
+        current_price = market_data_cache.get_ltp_if_fresh(instrument_key)
+        if current_price is not None and signal_price > 0:
+            drift = abs(current_price - signal_price) / signal_price
+            if drift > max_slippage_pct:
+                logger.warning(
+                    f"ExecutionManager: Drift rejected for {symbol} "
+                    f"(signal={signal_price}, current={current_price}, drift={drift:.4f})"
+                )
+                return None
+
         await self._rate_limiter.acquire()
 
         # Calculate limit price with slippage buffer
@@ -113,6 +146,27 @@ class ExecutionManager:
             limit_price = round(signal_price + slippage_amt, 2)
         else:
             limit_price = round(signal_price - slippage_amt, 2)
+
+        # ── Pre-API Trade Persistence (Fix Group 4) ──
+        temp_order_id = f"pending_{uuid.uuid4().hex[:8]}"
+        risk_amount = round(abs(signal_price - stop_loss) * quantity, 2)
+        trade = LiveTrade(
+            symbol=symbol,
+            instrument_key=instrument_key,
+            direction=direction,
+            quantity=quantity,
+            entry_price=signal_price,       # signal price (pre-fill)
+            stop_loss=stop_loss,
+            target_price=target_price,
+            risk_amount=risk_amount,
+            broker_order_id=temp_order_id,
+            filled_quantity=0,
+            average_price=0.0,
+            status="PENDING",
+        )
+        self.db.add(trade)
+        await self.db.flush()
+        logger.info(f"ExecutionManager: Registered Pending LiveTrade {trade.id} for {symbol}")
 
         broker_order_id: str = ""
         order_status: str = "PENDING"
@@ -144,6 +198,11 @@ class ExecutionManager:
                     data = resp.json().get("data", {})
                     broker_order_id = data.get("order_id", "")
                     order_status = "PENDING"
+                    
+                    # Update trade with actual broker ID
+                    trade.broker_order_id = broker_order_id
+                    await self.db.flush()
+
                     logger.info(
                         f"ExecutionManager: LIVE ORDER PLACED — {direction} {quantity} "
                         f"{symbol} @ Limit ₹{limit_price} | Order ID: {broker_order_id}"
@@ -155,12 +214,20 @@ class ExecutionManager:
                         f"ExecutionManager: Upstox order rejected "
                         f"(HTTP {resp.status_code}): {error_msg}"
                     )
+                    # Mark trade failed
+                    trade.status = "REJECTED"
+                    trade.close_reason = "API_ERROR"
+                    await self.db.flush()
                     increment_api_error()
                     return None
             else:
                 # ── Paper/simulation fallback when no token is configured ──
                 broker_order_id = f"paper_{uuid.uuid4().hex[:8]}"
                 order_status = "PENDING"
+                
+                trade.broker_order_id = broker_order_id
+                await self.db.flush()
+                
                 logger.info(
                     f"ExecutionManager: Simulation order — {direction} {quantity} "
                     f"{symbol} @ ₹{limit_price} | Order ID: {broker_order_id}"
@@ -169,6 +236,9 @@ class ExecutionManager:
 
         except Exception as e:
             logger.exception(f"ExecutionManager API Error placing order for {symbol}")
+            trade.status = "ERROR"
+            trade.close_reason = "EXCEPTION"
+            await self.db.flush()
             increment_api_error()
             return None
 
@@ -182,29 +252,67 @@ class ExecutionManager:
             level="INFO"
         ))
 
-        trade = LiveTrade(
-            symbol=symbol,
-            instrument_key=instrument_key,
-            direction=direction,
-            quantity=quantity,
-            entry_price=signal_price,       # signal price (pre-fill)
-            stop_loss=stop_loss,
-            target_price=target_price,
-            broker_order_id=broker_order_id,
-            filled_quantity=0,
-            average_price=0.0,
-            status=order_status,
+
+
+        # ── Audit: order placed event ──
+        await self._emit_order_event(
+            order_id=broker_order_id,
+            event_type="placed",
+            payload={
+                "symbol": symbol,
+                "direction": direction,
+                "quantity": quantity,
+                "limit_price": limit_price,
+                "stop_loss": stop_loss,
+                "target_price": target_price,
+            },
         )
-        self.db.add(trade)
-        await self.db.flush()
 
-        logger.info(f"ExecutionManager: Registered LiveTrade {trade.id} for {symbol}")
-
-        # Fix 1: SL and target orders are no longer placed here.
-        # They will be placed in handle_webhook() upon fill confirmation
-        # to avoid duplicate orders and naked short exposure on partial fills.
+        # Fix Group 4: Place protection orders immediately
+        asyncio.create_task(self._place_protection_orders_with_retry(trade.id, stop_loss, target_price))
 
         return trade
+
+    async def _place_protection_orders_with_retry(self, trade_id: int, stop_loss: float, target_price: float):
+        """Fix Group 4: Attempt SL/TP placement after entry with exponential backoff."""
+        await asyncio.sleep(1) # Give Upstox time to register the entry
+        for attempt in range(1, 4):
+            try:
+                # Refresh trade from DB
+                trade = await self.db.get(LiveTrade, trade_id)
+                if not trade or trade.status in ("CLOSED", "REJECTED", "CANCELLED"):
+                    return
+                # SL
+                if not trade.sl_order_id:
+                    sl_id = await self.place_sl_order(trade, stop_loss)
+                    if sl_id:
+                        trade.sl_order_id = sl_id
+                        logger.info(f"ExecutionManager: Immediate SL placed for {trade.symbol}: {sl_id}")
+                # TP
+                if not trade.target_order_id:
+                    tp_id = await self.place_target_order(trade, target_price)
+                    if tp_id:
+                        trade.target_order_id = tp_id
+                        logger.info(f"ExecutionManager: Immediate Target placed for {trade.symbol}: {tp_id}")
+                
+                if trade.sl_order_id and trade.target_order_id:
+                    await self.db.commit()
+                    return # Success
+                await self.db.commit()
+            except Exception as e:
+                logger.error(f"ExecutionManager: Protection order error for trade {trade_id}: {e}")
+            
+            # Backoff before retry
+            if attempt < 3:
+                await asyncio.sleep(2 ** attempt)
+
+        # After all retries failed:
+        trade = await self.db.get(LiveTrade, trade_id)
+        if trade and trade.status not in ("CLOSED", "REJECTED", "CANCELLED"):
+            if not trade.sl_order_id:
+                trade.sl_order_id = None
+                logger.error(f"CRITICAL: SL order placement failed, enabling local protection for trade {trade.id}")
+            await self.db.commit()
 
     async def _retry_api_call(
         self,
@@ -453,19 +561,49 @@ class ExecutionManager:
         if not broker_order_id or not status:
             return
 
+        # Fix Group 1: Webhook Zombie Trade Bug — match any order ID belonging to the trade
         result = await self.db.execute(
-            select(LiveTrade).where(LiveTrade.broker_order_id == broker_order_id)
+            select(LiveTrade).where(
+                or_(
+                    LiveTrade.broker_order_id == broker_order_id,
+                    LiveTrade.sl_order_id == broker_order_id,
+                    LiveTrade.target_order_id == broker_order_id
+                )
+            ).limit(1)
         )
         trade = result.scalar_one_or_none()
         if not trade:
             logger.warning(f"ExecutionManager Webhook: No trade found for order {broker_order_id}")
             return
 
-        trade.filled_quantity = filled_qty
-        trade.average_price = avg_price
+        is_sl = trade.sl_order_id == broker_order_id
+        is_tp = trade.target_order_id == broker_order_id
 
+        if not is_sl and not is_tp:
+            # We are updating the entry order
+            trade.filled_quantity = filled_qty
+            trade.average_price = avg_price
+        
         if status == "complete":
-            # Fix 3: Webhook deduplication. Ignore if already OPEN and SL placed.
+            if is_sl:
+                trade.status = "CLOSED"
+                trade.exit_price = avg_price
+                trade.close_reason = "STOP_LOSS"
+                trade.closed_at = datetime.now(IST)
+                logger.info(f"ExecutionManager Webhook: SL FILLED for {trade.symbol}")
+                # Release risk reservation? Risk group fixes will handle this based on status.
+                await self.db.commit()
+                return
+            elif is_tp:
+                trade.status = "CLOSED"
+                trade.exit_price = avg_price
+                trade.close_reason = "TARGET"
+                trade.closed_at = datetime.now(IST)
+                logger.info(f"ExecutionManager Webhook: TARGET FILLED for {trade.symbol}")
+                await self.db.commit()
+                return
+
+            # Fix 3: Webhook deduplication. Ignore if already OPEN.
             if trade.status == "OPEN" and trade.sl_order_id:
                 logger.debug(f"ExecutionManager Webhook: Order {broker_order_id} already processed. Ignoring.")
                 return
@@ -480,37 +618,18 @@ class ExecutionManager:
                 )
             trade.entry_price = avg_price   # update to actual fill price
 
-            # Fix 3: NOW place SL-M and target orders after entry fill is confirmed.
-            # Placing before fill (in place_order) would create orphan SL orders
-            # if the entry is rejected, risking naked short exposure.
-            if self._token:
-                sl_order_id = await self.place_sl_order(trade, trade.stop_loss)
-                if sl_order_id:
-                    trade.sl_order_id = sl_order_id
-                    logger.info(
-                        f"ExecutionManager Webhook: SL-M placed for {trade.symbol} "
-                        f"trigger=₹{trade.stop_loss} | SL order: {sl_order_id}"
-                    )
-                else:
-                    logger.error(
-                        f"ExecutionManager Webhook: CRITICAL — SL FAILED after fill "
-                        f"for {trade.symbol} Trade={trade.id}. Manual SL required!"
-                    )
-                    asyncio.create_task(notifier.send_alert(
-                        title="🚨 SL Order Failed After Fill",
-                        message=(
-                            f"CRITICAL: Entry filled but SL FAILED for {trade.symbol}.\n"
-                            f"Trade {trade.id} | Fill: ₹{avg_price:.2f} | SL: ₹{trade.stop_loss:.2f}\n"
-                            f"Place stop-loss MANUALLY IMMEDIATELY!"
-                        ),
-                        level="CRITICAL",
-                    ))
-                target_order_id = await self.place_target_order(trade, trade.target_price)
-                if target_order_id:
-                    trade.target_order_id = target_order_id
-
+            # The SL/TP orders are now placed immediately in place_order (Fix Group 4).
+            # We just leave this for edge case recovery or rely solely on place_order.
+            if self._token and not trade.sl_order_id:
+                asyncio.create_task(self._place_protection_orders_with_retry(trade.id, trade.stop_loss, trade.target_price))
 
         elif status in ("rejected", "cancelled"):
+            if is_sl or is_tp:
+                if is_sl: trade.sl_order_id = None
+                if is_tp: trade.target_order_id = None
+                logger.warning(f"ExecutionManager Webhook: {'SL' if is_sl else 'TP'} CANCELLED/REJECTED for {trade.symbol}")
+                await self.db.commit()
+                return
             if filled_qty > 0:
                 # ── Partial fill ────────────────────────────────────────────────────
                 # Only quantity shrinks; SL/TP *prices* remain unchanged.

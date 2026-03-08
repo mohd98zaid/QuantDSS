@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from datetime import datetime, timezone, timedelta, date
 
 from sqlalchemy import select
@@ -31,6 +32,8 @@ from app.models.risk_config import RiskConfig
 from app.models.signal import Signal as SignalModel
 from app.workers.base import WorkerBase
 
+
+from app.core.redis_lock import redis_lock
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -108,11 +111,11 @@ class RiskEngineWorker(WorkerBase):
         """Load or create today's DailyRiskState."""
         today = datetime.now(IST).date()
         result = await db.execute(
-            select(DailyRiskState).where(DailyRiskState.date == today).limit(1)
+            select(DailyRiskState).where(DailyRiskState.trade_date == today).limit(1)
         )
         state = result.scalar_one_or_none()
         if state is None:
-            state = DailyRiskState(date=today)
+            state = DailyRiskState(trade_date=today)
             db.add(state)
             await db.commit()
             await db.refresh(state)
@@ -153,67 +156,112 @@ class RiskEngineWorker(WorkerBase):
         )
 
         async with async_session_factory() as db:
-            portfolio = await self._load_portfolio(db)
-            state = await self._load_daily_state(db)
+            try:
+                # ── DISTRIBUTED LOCK FOR RISK EVALUATION (Fix Group 5) ──
+                # This ensures only one worker assesses portfolio risk at a time for this symbol
+                async with redis_lock(f"risk_eval:{symbol_name}", timeout=2):
+                    portfolio = await self._load_portfolio(db)
+                    
+                    # Fix Group 5: Risk Reservation Concurrency Injection
+                    from app.core.redis import redis_client
+                    
+                    # Read all expiring reservations
+                    res_keys = await redis_client.keys("risk_reservation:*")
+                    if res_keys:
+                        for key in res_keys:
+                            try:
+                                res_val = await redis_client.get(key)
+                                if res_val:
+                                    res_data = json.loads(res_val.decode() if isinstance(res_val, bytes) else res_val)
+                                    portfolio.open_positions += 1
+                                    portfolio.committed_risk += float(res_data.get("risk_amount", 0))
+                                    portfolio.open_position_values.append(float(res_data.get("notional", 0)))
+                            except Exception as e:
+                                logger.warning(f"Failed to parse risk reservation {key}: {e}")
 
-            # Run risk validation
-            decision: RiskDecision = self._risk_engine.validate(
-                raw_signal, state, portfolio,
-            )
+                    state = await self._load_daily_state(db)
 
-            if decision.status == "APPROVED":
-                # Publish to signals:risk_passed
-                message = {
-                    **data,  # Pass through all original fields
-                    "quantity": str(decision.quantity or 0),
-                    "risk_amount": str(decision.risk_amount or 0),
-                    "risk_pct": str(decision.risk_pct or 0),
-                    "risk_reward": str(decision.risk_reward or 0),
-                    "risk_status": "APPROVED",
-                }
-                pub_id = await publish_to_stream(STREAM_SIGNALS_RISK_PASSED, message)
+                    # Run risk validation
+                    decision: RiskDecision = self._risk_engine.validate(
+                        raw_signal, state, portfolio,
+                    )
 
-                # Update daily state counters
-                state.signals_approved = (state.signals_approved or 0) + 1
-                state.last_signal_time = datetime.now(timezone.utc)
-                await db.commit()
+                    if decision.status == "APPROVED":
+                        # Publish to signals:risk_passed
+                        message = {
+                            **data,  # Pass through all original fields
+                            "quantity": str(decision.quantity or 0),
+                            "risk_amount": str(decision.risk_amount or 0),
+                            "risk_pct": str(decision.risk_pct or 0),
+                            "risk_reward": str(decision.risk_reward or 0),
+                            "risk_status": "APPROVED",
+                        }
+                        
+                        # Fix Group 5: Reserve risk atomically with TTL
+                        new_qty = decision.quantity or 0
+                        new_notional = new_qty * raw_signal.entry_price
+                        new_risk = decision.risk_amount or 0.0
+                        
+                        trace_id = data.get("_trace_id") or str(uuid.uuid4())
+                        res_data = {
+                            "symbol": symbol_name,
+                            "quantity": new_qty,
+                            "notional": new_notional,
+                            "risk_amount": new_risk,
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                        await redis_client.setex(f"risk_reservation:{trace_id}", 120, json.dumps(res_data))
 
-                logger.info(
-                    f"[{self.NAME}] ✅ Risk APPROVED: {symbol_name} {signal_type} "
-                    f"qty={decision.quantity} → {STREAM_SIGNALS_RISK_PASSED} (id={pub_id})"
-                )
-            else:
-                # Log rejection
-                status_label = decision.status  # BLOCKED or SKIPPED
-                reason = decision.reason or "unknown"
+                        pub_id = await publish_to_stream(STREAM_SIGNALS_RISK_PASSED, message)
 
-                if status_label == "BLOCKED":
-                    state.signals_blocked = (state.signals_blocked or 0) + 1
-                else:
-                    state.signals_skipped = (state.signals_skipped or 0) + 1
-                await db.commit()
+                        # Update daily state counters
+                        state.signals_approved = (state.signals_approved or 0) + 1
+                        state.last_signal_time = datetime.now(timezone.utc)
+                        await db.commit()
 
-                # Persist rejected signal to DB
-                try:
-                    db.add(SignalModel(
-                        symbol_id=symbol_id if symbol_id else None,
-                        signal_type=signal_type,
-                        entry_price=entry_price,
-                        stop_loss=stop_loss,
-                        target_price=target_price,
-                        risk_status=status_label,
-                        block_reason=f"RiskEngine: {reason}",
-                        confidence_score=int(float(quality_score) if quality_score else 0),
-                        candle_time=candle_time,
-                    ))
-                    await db.commit()
-                except Exception as e:
-                    logger.warning(f"[{self.NAME}] Rejected signal DB log failed: {e}")
+                        logger.info(
+                            f"[{self.NAME}] ✅ Risk APPROVED: {symbol_name} {signal_type} "
+                            f"qty={decision.quantity} → {STREAM_SIGNALS_RISK_PASSED} (id={pub_id})"
+                        )
+                    else:
+                        # Log rejection
+                        status_label = decision.status  # BLOCKED or SKIPPED
+                        reason = decision.reason or "unknown"
 
-                logger.info(
-                    f"[{self.NAME}] ❌ Risk {status_label}: {symbol_name} {signal_type} "
-                    f"— {reason}"
-                )
+                        if status_label == "BLOCKED":
+                            state.signals_blocked = (state.signals_blocked or 0) + 1
+                        else:
+                            state.signals_skipped = (state.signals_skipped or 0) + 1
+                        await db.commit()
+
+                        # Persist rejected signal to DB
+                        try:
+                            # Use a separate session to ensure isolation for rejected signal logging
+                            async with async_session_factory() as reject_db:
+                                reject_db.add(SignalModel(
+                                    symbol_id=symbol_id if symbol_id else None,
+                                    signal_type=signal_type,
+                                    entry_price=entry_price,
+                                    stop_loss=stop_loss,
+                                    target_price=target_price,
+                                    risk_status=status_label,
+                                    block_reason=f"RiskEngine: {reason}",
+                                    confidence_score=int(float(quality_score) if quality_score else 0),
+                                    candle_time=candle_time,
+                                ))
+                                await reject_db.commit()
+                        except Exception as e:
+                            logger.warning(f"[{self.NAME}] Rejected signal DB log failed: {e}")
+
+                        logger.info(
+                            f"[{self.NAME}] ❌ Risk {status_label}: {symbol_name} {signal_type} "
+                            f"— {reason}"
+                        )
+            except TimeoutError:
+                logger.warning(f"[{self.NAME}] Timeout waiting for risk lock for {symbol_name}")
+                # Could re-publish to approved queue or drop depending on latency architecture
+            except Exception as e:
+                logger.exception(f"[{self.NAME}] Error during risk evaluation for {symbol_name}: {e}")
 
     # ── Main Loop ────────────────────────────────────────────────────────────
 

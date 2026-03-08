@@ -94,10 +94,12 @@ async def update_broker_token(
     set_token_override(token)
 
     # 2. Write back to .env so it survives restarts
-    env_paths = [
-        Path("/app").parent / ".env",          # Docker path
-        Path(__file__).resolve().parents[5] / ".env",  # local path
-    ]
+    env_paths = [Path("/app").parent / ".env"] # Docker fallback
+    try:
+        env_paths.append(Path(__file__).resolve().parents[4] / ".env")
+    except Exception:
+        pass
+        
     written = False
     for env_path in env_paths:
         if env_path.exists():

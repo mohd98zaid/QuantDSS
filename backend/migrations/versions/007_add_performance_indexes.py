@@ -7,7 +7,7 @@ Create Date: 2026-03-06
 from alembic import op
 
 revision = "007_performance_indexes"
-down_revision = "006_audit_log"
+down_revision = "006"
 branch_labels = None
 depends_on = None
 

@@ -107,97 +107,7 @@ async def _persist_signal_to_db(
 
 # ── Risk Engine Validation ───────────────────────────────────────────────────
 
-async def _validate_with_risk_engine(signal: ConsolidatedSignal):
-    """
-    Load RiskConfig, DailyRiskState, and Portfolio from DB, then call
-    RiskEngine.validate(). Returns the RiskDecision.
-    """
-    from app.core.database import async_session_factory
-    from app.models.risk_config import RiskConfig
-    from app.models.daily_risk_state import DailyRiskState
-    from app.models.paper_trade import PaperTrade
-    from app.models.live_trade import LiveTrade
-    from app.engine.risk_engine import RiskEngine, Portfolio
-    from app.engine.base_strategy import RawSignal
-    from sqlalchemy import func
-
-    async with async_session_factory() as db:
-        # Load risk config
-        rc = await db.execute(select(RiskConfig).limit(1))
-        risk_cfg = rc.scalar_one_or_none()
-
-        if not risk_cfg:
-            # No risk config — cannot validate, create a default decision
-            from dataclasses import dataclass
-
-            @dataclass
-            class _DefaultReject:
-                status: str = "BLOCKED"
-                reason: str = "NO_RISK_CONFIG"
-                quantity: int | None = None
-                risk_amount: float | None = None
-
-            logger.warning("FinalAlertGenerator: No RiskConfig found — blocking signal")
-            return _DefaultReject()
-
-        # Load daily risk state
-        today = date.today()
-        rs = await db.execute(
-            select(DailyRiskState).where(DailyRiskState.trade_date == today)
-        )
-        risk_state = rs.scalar_one_or_none()
-
-        # Build portfolio from open trades
-        current_balance = float(risk_cfg.paper_balance) if risk_cfg else 100_000.0
-        try:
-            result_p = await db.execute(
-                select(PaperTrade).where(PaperTrade.status == "OPEN")
-            )
-            open_paper = result_p.scalars().all()
-            result_l = await db.execute(
-                select(LiveTrade).where(LiveTrade.status == "OPEN")
-            )
-            open_live = result_l.scalars().all()
-            all_open = list(open_paper) + list(open_live)
-
-            portfolio = Portfolio(
-                current_balance=current_balance,
-                peak_balance=current_balance,
-                open_positions=len(all_open),
-                open_symbols=[t.symbol for t in all_open],
-                open_position_values=[
-                    float(t.entry_price or 0) * int(t.quantity or 0)
-                    for t in all_open
-                ],
-                committed_risk=sum(
-                    float(getattr(t, "risk_amount", None) or 0)
-                    for t in all_open
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"FinalAlertGenerator: portfolio load failed: {e}")
-            portfolio = Portfolio(
-                current_balance=current_balance,
-                peak_balance=current_balance,
-            )
-
-        # Construct RawSignal for the risk engine
-        raw_signal = RawSignal(
-            strategy_id=0,
-            symbol_id=str(signal.symbol_name or signal.symbol_id),
-            signal_type=signal.signal_type,
-            entry_price=signal.entry_price,
-            stop_loss=signal.stop_loss,
-            target_price=signal.target_price,
-            atr_value=signal.atr_value,
-            candle_time=signal.first_timestamp or datetime.now(IST),
-        )
-
-        # Validate through all 17 risk rules
-        engine = RiskEngine(risk_cfg)
-        decision = engine.validate(raw_signal, risk_state, portfolio)
-
-        return decision
+# Risk validation has been moved entirely to RiskEngineWorker (Fix Group 3)
 
 
 # ── Main Class ───────────────────────────────────────────────────────────────
@@ -227,43 +137,19 @@ class FinalAlertGenerator:
             f"{signal.signal_type} @ ₹{signal.entry_price:.2f}"
         )
 
-        # ── MANDATORY: Risk Engine Validation ─────────────────────────────
+        # ── Pipeline Terminus ─────────────────────────────────────────────
+        # Signals are no longer risk-checked here.
+        # They are marked PENDING_RISK and published to Redis for the Risk Worker.
         try:
-            risk_decision = await _validate_with_risk_engine(signal)
+            signal.risk_quantity = None
+            signal.risk_amount = None
+            
+            SignalTracer.trace_pass(
+                trace_id, "PIPELINE_COMPLETE", sym_name, "Publishing to signals:approved"
+            )
         except Exception as e:
-            logger.exception(f"FinalAlertGenerator: Risk Engine error for {sym_name}: {e}")
-            await _persist_signal_to_db(
-                signal, status="BLOCKED",
-                block_reason=f"RISK_ENGINE_ERROR: {str(e)[:200]}",
-            )
-            SignalTracer.trace_drop(trace_id, "RISK_ENGINE", sym_name, f"Error: {e}")
+            logger.exception(f"FinalAlertGenerator: Pipeline completion error for {sym_name}: {e}")
             return
-
-        if risk_decision.status != "APPROVED":
-            # Signal rejected by risk engine — log and persist
-            SignalTracer.trace_drop(
-                trace_id, "RISK_ENGINE", sym_name,
-                f"{risk_decision.status}: {risk_decision.reason}"
-            )
-            logger.info(
-                f"FinalAlertGenerator: {sym_name} {signal.signal_type} "
-                f"REJECTED by Risk Engine: {risk_decision.reason}"
-            )
-            await _persist_signal_to_db(
-                signal,
-                status=risk_decision.status,
-                block_reason=risk_decision.reason,
-            )
-            return
-
-        # ── Signal APPROVED ───────────────────────────────────────────────
-        signal.risk_quantity = risk_decision.quantity
-        signal.risk_amount = risk_decision.risk_amount
-
-        SignalTracer.trace_pass(
-            trace_id, "RISK_ENGINE", sym_name,
-            f"qty={risk_decision.quantity} risk=₹{risk_decision.risk_amount or 0:.0f}"
-        )
 
         logger.info(
             f"🚀 FINAL ALERT: {sym_name} {signal.signal_type} "
@@ -275,11 +161,9 @@ class FinalAlertGenerator:
             f"Qty={risk_decision.quantity}"
         )
 
-        # 1. Persist approved signal to DB
+        # 1. Persist approved signal to DB as PENDING_RISK
         await _persist_signal_to_db(
-            signal, status="APPROVED",
-            risk_quantity=risk_decision.quantity,
-            risk_amount=risk_decision.risk_amount,
+            signal, status="PENDING_RISK",
         )
 
         # 2. Publish to SSE stream for UI
@@ -295,52 +179,33 @@ class FinalAlertGenerator:
                 "ml_probability": getattr(signal, "ml_probability", None),
                 "sentiment": getattr(signal, "nlp_sentiment", None),
                 "strategies_confirmed": getattr(signal, "contributing_strategies", []),
-                "risk_status": "APPROVED",
-                "risk_quantity": risk_decision.quantity,
+                "risk_status": "PENDING_RISK",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
         except Exception as e:
             logger.debug(f"SSE publish failed for {sym_name}: {e}")
 
-        # 3. Push DIRECTLY to AutoTrader queue (NOT through scanner hook)
-        SignalTracer.trace(trace_id, "AUTOTRADER_QUEUE", sym_name, "Enqueueing for execution")
+        # 3. Publish to Redis for Risk Worker
         try:
-            from app.engine.auto_trader_engine import autotrader_queue
-
-            # Build a minimal result object for the AutoTrader
-            from app.api.routers.scanner import BulkScanResult
-
-            result = BulkScanResult(
-                symbol=sym_name,
-                ltp=round(float(signal.entry_price), 2),
-                change_pct=0.0,
-                signal=signal.signal_type,
-                entry_price=round(float(signal.entry_price), 2),
-                stop_loss=round(float(signal.stop_loss), 2),
-                target_price=round(float(signal.target_price), 2),
-                risk_reward=round(
-                    abs(signal.target_price - signal.entry_price) /
-                    max(abs(signal.entry_price - signal.stop_loss), 0.01),
-                    2
-                ),
-                strategy_name=", ".join(getattr(signal, "contributing_strategies", [])),
-                rsi=None,
-                trend=None,
-                ema_cross=None,
-                signal_quality_score=getattr(signal, "quality_score", None),
-                ml_probability=getattr(signal, "ml_probability", None),
-                sentiment=getattr(signal, "nlp_sentiment", None),
-                strategies_confirmed=getattr(signal, "contributing_strategies", None),
-                data_source="intelligence_pipeline",
-                error=None,
-            )
-            # Enqueue directly to AutoTrader (risk already validated above)
-            await autotrader_queue.enqueue([result], "multi_strategy", "5min")
-
+            from app.core.streams import publish_to_stream, STREAM_SIGNALS_APPROVED
+            import json
+            
+            message = {
+                "symbol_id": str(getattr(signal, "symbol_id", "0")),
+                "symbol_name": sym_name,
+                "signal_type": signal.signal_type,
+                "entry_price": str(signal.entry_price),
+                "stop_loss": str(signal.stop_loss),
+                "target_price": str(signal.target_price),
+                "atr_value": str(signal.atr_value),
+                "candle_time": getattr(signal, "first_timestamp", datetime.now(timezone.utc)).isoformat(),
+                "contributing_strategies": json.dumps(getattr(signal, "contributing_strategies", [])),
+                "quality_score": str(getattr(signal, "quality_score", "0")),
+                "_trace_id": trace_id,
+            }
+            await publish_to_stream(STREAM_SIGNALS_APPROVED, message)
         except Exception as e:
-            logger.exception(
-                f"FinalAlertGenerator: AutoTrader enqueue failed for {sym_name}: {e}"
-            )
+            logger.exception(f"FinalAlertGenerator: Redis publish failed for {sym_name}: {e}")
 
 
 # Public helper for rejection logging from upstream layers

@@ -701,8 +701,8 @@ async def run_auto_trader() -> None:
                 },
             )
 
-            # Dedup check
-            if signal_dedup.is_duplicate(
+            # Dedup check (Implicitly records if it wasn't a duplicate)
+            if await signal_dedup.is_duplicate(
                 candidate.symbol_id, candidate.strategy_id, candidate.candle_time
             ):
                 SignalTracer.trace_drop(
@@ -711,9 +711,6 @@ async def run_auto_trader() -> None:
                 )
                 continue
 
-            signal_dedup.record(
-                candidate.symbol_id, candidate.strategy_id, candidate.candle_time
-            )
             await signal_pool.add_signal(candidate)
             fed += 1
 

@@ -27,6 +27,15 @@ STREAM_SIGNALS_APPROVED = "signals:approved"
 STREAM_SIGNALS_RISK_PASSED = "signals:risk_passed"
 STREAM_SIGNALS_EXECUTED = "signals:executed"
 
+# ── Redis Stream → Kafka Topic Mapping ───────────────────────────────────────
+_STREAM_TO_KAFKA_TOPIC: dict[str, str] = {
+    STREAM_CANDLES: "market.candles",
+    STREAM_SIGNALS_CANDIDATE: "signals.candidate",
+    STREAM_SIGNALS_APPROVED: "signals.approved",
+    STREAM_SIGNALS_RISK_PASSED: "signals.risk_passed",
+    STREAM_SIGNALS_EXECUTED: "signals.executed",
+}
+
 # Default maxlen for all streams (approximate trimming)
 DEFAULT_MAXLEN = 10_000
 
@@ -63,6 +72,21 @@ async def publish_to_stream(
         msg_id = await redis_client.xadd(
             stream, flat, maxlen=maxlen, approximate=True,
         )
+
+        # Dual-write to Kafka when enabled
+        try:
+            from app.core.config import settings
+            if settings.kafka_enabled:
+                from app.core.kafka_client import kafka_producer
+                kafka_topic = _STREAM_TO_KAFKA_TOPIC.get(stream)
+                if kafka_topic:
+                    symbol_key = flat.get("symbol", flat.get("symbol_name", ""))
+                    await kafka_producer.send(
+                        kafka_topic, value=flat, key=symbol_key or None,
+                    )
+        except Exception as kafka_err:
+            logger.debug(f"Kafka dual-write to {stream} failed (non-critical): {kafka_err}")
+
         return msg_id
     except Exception as e:
         logger.exception(f"publish_to_stream({stream}) failed: {e}")
@@ -185,3 +209,29 @@ def decode_stream_message(data: dict) -> dict[str, str]:
         )
         for k, v in data.items()
     }
+
+
+# ── Kafka Consumer Helper ────────────────────────────────────────────────────
+
+async def consume_from_kafka(
+    stream: str,
+    group: str,
+    handler: Callable[[str, dict[str, str]], Awaitable[None]],
+    running: Callable[[], bool] | None = None,
+) -> None:
+    """
+    Consume messages from a Kafka topic instead of Redis Stream.
+
+    Uses the same handler signature as consume_stream() for drop-in compatibility.
+    The `stream` parameter is automatically mapped to its Kafka topic equivalent.
+    """
+    from app.core.kafka_client import kafka_consumer
+
+    kafka_topic = _STREAM_TO_KAFKA_TOPIC.get(stream, stream.replace(":", "."))
+
+    await kafka_consumer.consume(
+        topic=kafka_topic,
+        group_id=group,
+        handler=handler,
+        running=running,
+    )

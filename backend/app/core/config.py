@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     # See app/engine/trading_mode.py for enforcement logic.
     live_trading_lock: str = ""  # Set to "CONFIRMED" in .env to enable LIVE mode.
 
+    # ─── Signal Worker Sharding ──────────────────────────────
+    signal_worker_id: int = 0
+    signal_worker_total: int = 1
+
+    # ─── Kafka ───────────────────────────────────────────────
+    kafka_bootstrap_servers: str = "kafka:9092"
+    kafka_enabled: bool = False
+
+    # ─── AngelOne (Dual Feed) ────────────────────────────────────────
+    angel_api_key: str = ""
+    angel_client_id: str = ""
+    angel_password: str = ""
+    angel_totp_secret: str = ""
+
     # ─── Default User (single-user system) ───────────────────
     # REQUIRED — must be set in .env as DEFAULT_USERNAME / DEFAULT_PASSWORD.
     default_username: str = ""
@@ -87,6 +101,7 @@ class Settings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
+        "extra": "ignore",
     }
 
     def validate_security(self) -> None:

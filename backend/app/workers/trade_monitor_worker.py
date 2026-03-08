@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_session_factory
@@ -137,9 +137,9 @@ class TradeMonitorWorker(WorkerBase):
 
                         # Check SL hit
                         sl_hit = False
-                        if trade.signal == "BUY" and ltp <= trade.stop_loss:
+                        if trade.direction == "BUY" and ltp <= trade.stop_loss:
                             sl_hit = True
-                        elif trade.signal == "SELL" and ltp >= trade.stop_loss:
+                        elif trade.direction == "SELL" and ltp >= trade.stop_loss:
                             sl_hit = True
 
                         if sl_hit:
@@ -157,9 +157,9 @@ class TradeMonitorWorker(WorkerBase):
 
                         # Check Target hit
                         target_hit = False
-                        if trade.signal == "BUY" and ltp >= trade.target_price:
+                        if trade.direction == "BUY" and ltp >= trade.target_price:
                             target_hit = True
-                        elif trade.signal == "SELL" and ltp <= trade.target_price:
+                        elif trade.direction == "SELL" and ltp <= trade.target_price:
                             target_hit = True
 
                         if target_hit:
@@ -218,14 +218,39 @@ class TradeMonitorWorker(WorkerBase):
                             try:
                                 from app.engine.execution_manager import ExecutionManager
                                 mgr = ExecutionManager(db)
-                                await mgr.square_off_trade(trade, reason="EOD_SQUAREOFF")
-                                logger.info(
-                                    f"[{self.NAME}] Live EOD square-off: {trade.symbol}"
-                                )
+                                # Fix Group 3: Use place_market_close_order instead of non-existent square_off_trade
+                                success = await mgr.place_market_close_order(trade)
+                                if success:
+                                    logger.info(f"[{self.NAME}] Live EOD square-off submitted: {trade.symbol}")
+                                else:
+                                    logger.error(f"[{self.NAME}] Live EOD square-off submission FAILED for {trade.symbol}")
                             except Exception as e:
                                 logger.exception(
-                                    f"[{self.NAME}] Live EOD square-off failed {trade.symbol}: {e}"
+                                    f"[{self.NAME}] Live EOD square-off exception for {trade.symbol}: {e}"
                                 )
+                            continue
+
+                        # Fix Group 1: Fallback stop-loss monitor
+                        if not trade.sl_order_id:
+                            local_sl_hit = False
+                            if trade.direction == "BUY" and ltp <= trade.stop_loss:
+                                local_sl_hit = True
+                            elif trade.direction == "SELL" and ltp >= trade.stop_loss:
+                                local_sl_hit = True
+
+                            if local_sl_hit:
+                                logger.error(f"[{self.NAME}] CRITICAL: Local SL triggered for naked trade {trade.symbol}")
+                                try:
+                                    from app.engine.execution_manager import ExecutionManager
+                                    mgr = ExecutionManager(db)
+                                    success = await mgr.place_market_close_order(trade)
+                                    if success:
+                                        logger.info(f"[{self.NAME}] Local SL fallback close submitted: {trade.symbol}")
+                                    else:
+                                        logger.error(f"[{self.NAME}] Local SL fallback FAILED for {trade.symbol}")
+                                except Exception as e:
+                                    logger.exception(f"[{self.NAME}] Local SL fallback exception for {trade.symbol}: {e}")
+                                continue
 
                     except Exception as e:
                         logger.exception(
@@ -241,11 +266,11 @@ class TradeMonitorWorker(WorkerBase):
 
     def _calc_pnl(self, trade, exit_price: float) -> float:
         """Calculate realised P&L for a trade."""
-        qty = getattr(trade, "quantity", 1) or 1
-        if trade.signal == "BUY":
-            return round((exit_price - trade.entry_price) * qty, 2)
+        qty = float(getattr(trade, "quantity", 1) or 1)
+        if trade.direction == "BUY":
+            return round(float(exit_price - float(trade.entry_price)) * qty, 2)
         else:
-            return round((trade.entry_price - exit_price) * qty, 2)
+            return round(float(float(trade.entry_price) - exit_price) * qty, 2)
 
     def _update_trailing_stop(self, trade, ltp: float):
         """Update trailing stop if price has moved favorably."""
@@ -256,7 +281,7 @@ class TradeMonitorWorker(WorkerBase):
         if initial_risk <= 0:
             return
 
-        if trade.signal == "BUY":
+        if trade.direction == "BUY":
             profit_distance = ltp - entry
             trigger = initial_risk * TRAIL_TRIGGER_RATIO
 
@@ -264,7 +289,7 @@ class TradeMonitorWorker(WorkerBase):
                 new_sl = ltp - (initial_risk * TRAIL_DISTANCE_RATIO)
                 if new_sl > trade.stop_loss:
                     old_sl = trade.stop_loss
-                    trade.stop_loss = round(new_sl, 2)
+                    trade.stop_loss = round(float(new_sl), 2)
                     logger.debug(
                         f"[{self.NAME}] Trail SL: {trade.symbol} "
                         f"₹{old_sl:.2f} → ₹{trade.stop_loss:.2f}"
@@ -277,7 +302,7 @@ class TradeMonitorWorker(WorkerBase):
                 new_sl = ltp + (initial_risk * TRAIL_DISTANCE_RATIO)
                 if new_sl < trade.stop_loss:
                     old_sl = trade.stop_loss
-                    trade.stop_loss = round(new_sl, 2)
+                    trade.stop_loss = round(float(new_sl), 2)
                     logger.debug(
                         f"[{self.NAME}] Trail SL: {trade.symbol} "
                         f"₹{old_sl:.2f} → ₹{trade.stop_loss:.2f}"

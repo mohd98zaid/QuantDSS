@@ -14,6 +14,7 @@ from app.models.auto_trade_config import AutoTradeConfig
 from app.models.live_trade import LiveTrade
 from app.models.strategy_health import StrategyHealth
 from app.models.strategy_health_log import StrategyHealthLog
+from app.models.executed_signal import ExecutedSignal
 
 __all__ = [
     "Symbol",
@@ -30,4 +31,5 @@ __all__ = [
     "PaperTrade",
     "LiveTrade",
     "StrategyHealth",
+    "ExecutedSignal",
 ]

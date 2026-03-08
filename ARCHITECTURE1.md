@@ -117,3 +117,85 @@ All signals pass through these layers in order. No bypass is permitted.
 3. **Strategy isolation** — strategies only return signals, no side effects
 4. **Meta-Strategy control** — disabled/regime-blocked strategies are filtered before confirmation
 5. **Signal traceability** — every signal gets a trace_id tracked across 18 stages
+
+---
+
+## Architecture Upgrades (v2)
+
+### Horizontal Signal Engine Sharding (Part 1)
+
+The signal engine is now horizontally scalable. A `ShardManager` uses deterministic
+`MD5(symbol) % N` hashing to assign each symbol to exactly one worker. This ensures:
+- No duplicate signal processing across workers
+- Consistent symbol assignment (same symbol always maps to same worker)
+- Linear throughput scaling with worker count
+
+**Config**: `SIGNAL_WORKER_ID` (0-based) + `SIGNAL_WORKER_TOTAL` (shard count)
+
+### Kafka Data Pipeline (Part 2)
+
+High-throughput streams migrate from Redis Streams to Apache Kafka when `KAFKA_ENABLED=true`.
+The system supports **dual-write mode**: messages publish to both Redis and Kafka simultaneously
+for backward compatibility.
+
+**Topics**: `market.candles`, `signals.candidate`, `signals.approved`, `signals.risk_passed`, `signals.executed`
+
+Kafka cluster (Zookeeper + Broker + UI) is opt-in via Docker Compose profiles: `--profile kafka`
+
+### Dual Broker Feed (Part 3)
+
+The system supports Upstox (primary) and AngelOne (secondary) market data feeds via `FeedManager`.
+- Health monitoring tracks `last_tick_timestamp` and `feed_source`
+- **Failover**: if Upstox is stale > 3 seconds, automatically switches to AngelOne
+- **Recovery**: when Upstox recovers, switches back to primary
+
+### Pipeline Latency Optimization (Part 4)
+
+The intelligence pipeline is split into **fast path** and **slow path**:
+- **Fast path** (<200ms): dedup → spread → liquidity → regime → risk → execute
+- **Slow path** (async): ML filter, NLP filter, meta-strategy analytics (shadow evaluation, non-blocking)
+
+### Research Backtest Engine (Part 5)
+
+A modular backtesting framework under `app/research/backtest_engine/`:
+- `DataLoader` — loads historical candles from TimescaleDB
+- `ResearchStrategyRunner` — batch runs across symbols × strategies
+- `PortfolioSimulator` — multi-strategy portfolio simulation
+- `TransactionCostModel` — NSE intraday costs (brokerage, STT, exchange, SEBI, GST, stamp)
+- `SlippageModel` — fixed, volume-based, and square-root impact models
+- `PerformanceMetrics` — Sharpe, Calmar, drawdown, expectancy, profit factor
+
+### ML Feature Store (Part 6)
+
+Production feature store under `app/ml/feature_store/`:
+- **FeatureSnapshot** — point-in-time feature vectors per symbol (indicators, volatility, regime, liquidity)
+- **FeatureSymbolStats** — aggregated daily statistics per symbol
+- **FeatureRegimeStats** — feature distributions per market regime
+- **FeatureExtractionWorker** — consumes candles, computes features, stores in PostgreSQL
+
+### Observability Stack (Part 7)
+
+Full Prometheus + Grafana monitoring with auto-provisioned dashboards:
+- `pipeline_latency`, `signal_rate`, `execution_latency`, `worker_lag_seconds`
+- `broker_api_errors`, `kafka_consumer_lag`, `redis_memory_usage`, `feed_health`
+- Opt-in via Docker Compose profiles: `--profile monitoring`
+
+### Market Replay Engine (Part 8)
+
+Deterministic replay of historical market sessions through the live pipeline:
+- Speed control (1x, 2x, 10x, max)
+- Symbol filtering
+- Candles marked with `is_replay=1` and `replay_session_id`
+- Full pipeline processing for debugging and strategy validation
+
+### Order Event Audit (Part 9)
+
+Complete order lifecycle tracking via `order_event` table:
+- Events: `placed`, `acknowledged`, `filled`, `partially_filled`, `sl_placed`, `tp_placed`, `cancelled`, `rejected`
+- JSON payload with full order context
+
+### Performance Optimization (Part 10)
+
+- Polars added as dependency for batch historical data processing
+- NumPy-vectorized fast paths for core indicator calculations
+- Target: indicator calculations under 50ms per symbol

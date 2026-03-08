@@ -622,11 +622,10 @@ async def _auto_trade_hook(results: list, strategy: str, timeframe: str) -> None
                 confidence_score=float(r.risk_reward or 0) * 20,  # Approx score
                 metadata={"symbol_name": r.symbol, "source": "scanner", "trace_id": trace_id},
             )
-            # Dedup check
-            if signal_dedup.is_duplicate(candidate.symbol_id, candidate.strategy_id, candidate.candle_time):
+            # Dedup check (Implicitly records if it wasn't a duplicate)
+            if await signal_dedup.is_duplicate(candidate.symbol_id, candidate.strategy_id, candidate.candle_time):
                 SignalTracer.trace_drop(trace_id, "DEDUP_CHECK", r.symbol, "Duplicate from scanner suppressed")
                 continue
-            signal_dedup.record(candidate.symbol_id, candidate.strategy_id, candidate.candle_time)
             await signal_pool.add_signal(candidate)
             fed += 1
         if fed:

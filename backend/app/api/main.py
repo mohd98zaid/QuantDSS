@@ -61,6 +61,7 @@ async def lifespan(app: FastAPI):
     import app.models.backtest_run       # noqa: F401
     import app.models.auto_trade_config  # noqa: F401
     import app.models.auto_trade_log     # noqa: F401
+    import app.models.executed_signal    # noqa: F401
 
     # Step 1: create all tables in their own committed transaction
     async with engine.begin() as conn:
