@@ -60,7 +60,7 @@ class StrategyRunner:
         """Remove a strategy from the runner."""
         self._strategies.pop(strategy_id, None)
 
-    def evaluate(
+    async def evaluate(
         self, candles: pd.DataFrame, symbol_id: int
     ) -> list[CandidateSignal]:
         """
@@ -73,10 +73,16 @@ class StrategyRunner:
         Returns:
             List of CandidateSignal objects (may be empty)
         """
+        from app.engine.strategy_health import strategy_health_monitor
         signals = []
 
         for strategy_id, strategy in self._strategies.items():
             try:
+                # Fix Group 6: Strategy Health Enforcement
+                if await strategy_health_monitor.is_disabled(strategy_id):
+                    logger.debug(f"StrategyRunner: Skipping disabled strategy {strategy_id}")
+                    continue
+
                 signal = strategy.evaluate(candles, symbol_id)
                 if signal is not None:
                     signals.append(signal)

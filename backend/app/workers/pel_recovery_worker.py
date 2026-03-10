@@ -34,6 +34,14 @@ class PelRecoveryWorker(WorkerBase):
 
     async def run(self):
         logger.info(f"[{self.NAME}] Starting comprehensive PEL recovery")
+        
+        # Fix Group 5: Initialize RiskEngine context
+        try:
+            await self._risk_engine._load_risk_config()
+            logger.info(f"[{self.NAME}] Successfully loaded RiskEngine configuration")
+        except Exception as e:
+            logger.error(f"[{self.NAME}] Failed to load RiskEngine configuration: {e}")
+
         while self.is_running:
             for stream, group, handler in self.targets:
                 try:
@@ -51,8 +59,17 @@ class PelRecoveryWorker(WorkerBase):
                         
                         idle_msg_ids = []
                         for msg in pending_msgs:
-                            if msg["time_since_delivered"] >= self.idle_ms:
-                                idle_msg_ids.append(msg["message_id"])
+                            msg_id = msg["message_id"]
+                            deliveries = msg.get("times_delivered", msg.get("delivered", 1))
+                            
+                            # Fix Group 5: Poison pill handling
+                            if deliveries > 5:
+                                logger.error(f"[{self.NAME}] Poison pill detected (deliveries={deliveries}) for msg {msg_id} on {stream}. Acknowledging to skip.")
+                                await redis_client.xack(stream, group, msg_id)
+                                continue
+
+                            if msg.get("time_since_delivered", 0) >= self.idle_ms:
+                                idle_msg_ids.append(msg_id)
 
                         if idle_msg_ids:
                             logger.info(f"[{self.NAME}] Claiming {len(idle_msg_ids)} idle messages from {stream}")
@@ -65,8 +82,21 @@ class PelRecoveryWorker(WorkerBase):
                                 decoded = {}
                                 for k, v in data.items():
                                     key = k.decode() if isinstance(k, bytes) else k
-                                    val = v.decode() if isinstance(v, bytes) else v # Corrected: val should be v, not val
+                                    val = v.decode() if isinstance(v, bytes) else v
                                     decoded[key] = val
+                                
+                                # Fix Group 5: Stale Signal Rejection
+                                msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+                                try:
+                                    msg_ts_ms = int(msg_id_str.split('-')[0])
+                                    msg_time = datetime.fromtimestamp(msg_ts_ms / 1000.0, tz=timezone.utc)
+                                    now = datetime.now(timezone.utc)
+                                    if (now - msg_time).total_seconds() > 300:
+                                        logger.warning(f"[{self.NAME}] Discarding stale PEL message {msg_id_str} (> 5 mins old)")
+                                        await redis_client.xack(stream, group, msg_id)
+                                        continue
+                                except Exception as e:
+                                    logger.error(f"[{self.NAME}] Failed to parse msg_id {msg_id_str} for stale check: {e}")
                                 
                                 logger.info(f"[{self.NAME}] Reprocessing claimed message {msg_id} via {handler.__name__}")
                                 await handler(msg_id, decoded)

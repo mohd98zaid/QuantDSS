@@ -23,6 +23,7 @@ Fix 6 (Position Sizer Risk Budget):
   - PositionSizer deducts committed_risk from total_risk before sizing.
   - Portfolio.committed_risk: float carries risk already used by open trades.
 """
+import asyncio
 import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timezone, timedelta
@@ -46,20 +47,71 @@ def _send_deduped_alert(title: str, message: str, level: str, key: str) -> None:
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(notifier.send_alert(title=title, message=message, level=level))
+        from app.alerts.telegram_notifier import send_telegram_alert
+        send_telegram_alert(f"🚨 {title}\n{message}")
     except RuntimeError:
         pass  # Synchronous test env, no loop
 
 
-# ── Global Application State for Circuit Breaker ──────────────
-consecutive_api_errors = 0
+# ── Distributed API Error Counter (Fix Group 2 / V-03) ────────
+# The counter lives in Redis so ALL worker processes share one authoritative
+# value. The old Python global was invisible across Docker containers.
+_REDIS_API_ERROR_KEY = "quantdss:api_errors"
 
-def increment_api_error():
-    global consecutive_api_errors
-    consecutive_api_errors += 1
 
-def reset_api_error():
-    global consecutive_api_errors
-    consecutive_api_errors = 0
+def increment_api_error() -> None:
+    """
+    Increment the shared broker API error counter in Redis.
+    Schedules an async task; safe to call from any async context.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_redis_incr_api_errors())
+    except RuntimeError:
+        pass  # no running loop in test/sync context — silently skip
+
+
+def reset_api_error() -> None:
+    """
+    Reset the shared broker API error counter in Redis to 0.
+    Schedules an async task; safe to call from any async context.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_redis_reset_api_errors())
+    except RuntimeError:
+        pass
+
+
+async def _redis_incr_api_errors() -> None:
+    """Internal: atomically increment the Redis error counter."""
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        await redis.incr(_REDIS_API_ERROR_KEY)
+    except Exception as exc:
+        logger.warning(f"RiskEngine: Could not increment Redis API error counter: {exc}")
+
+
+async def _redis_reset_api_errors() -> None:
+    """Internal: set the Redis error counter back to 0."""
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        await redis.set(_REDIS_API_ERROR_KEY, 0)
+    except Exception as exc:
+        logger.warning(f"RiskEngine: Could not reset Redis API error counter: {exc}")
+
+
+async def get_api_error_count() -> int:
+    """Return the current shared API error count from Redis."""
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        val = await redis.get(_REDIS_API_ERROR_KEY)
+        return int(val or 0)
+    except Exception:
+        return 0
 
 
 @dataclass
@@ -100,14 +152,38 @@ class RiskRule:
 
 # ─── Rule 0: Consecutive Errors Circuit Breaker ─────────────
 class ConsecutiveErrorsCircuitBreaker(RiskRule):
-    """BLOCK all trading if consecutive broker API errors exceed threshold."""
-    def check(self, signal: RawSignal, state, portfolio: Portfolio) -> RiskDecision:
-        global consecutive_api_errors
+    """
+    BLOCK all trading if consecutive broker API errors exceed threshold.
+
+    Fix Group 2 (V-03): error count now read from Redis so all worker
+    processes share one authoritative value.
+    """
+
+    async def async_check(self, signal: RawSignal, state, portfolio: Portfolio) -> RiskDecision:
+        """Async variant called by RiskEngine.validate_async()."""
         max_errors = int(getattr(self.config, "max_consecutive_errors", 5))
-        if consecutive_api_errors >= max_errors:
+        count = await get_api_error_count()
+        if count >= max_errors:
             return RiskDecision(
                 status="BLOCKED",
-                reason=f"CONSECUTIVE_ERRORS_LIMIT ({consecutive_api_errors})",
+                reason=f"CONSECUTIVE_ERRORS_LIMIT ({count})",
+            )
+        return RiskDecision(status="PASS")
+
+    def check(self, signal: RawSignal, state, portfolio: Portfolio) -> RiskDecision:
+        """Sync fallback (used by tests / non-async callers). Reads Redis synchronously."""
+        max_errors = int(getattr(self.config, "max_consecutive_errors", 5))
+        try:
+            import redis as _sync_redis
+            from app.core.config import settings
+            r = _sync_redis.from_url(settings.redis_url, decode_responses=True)
+            count = int(r.get(_REDIS_API_ERROR_KEY) or 0)
+        except Exception:
+            count = 0  # fail-open: don't block trading on Redis unavailability
+        if count >= max_errors:
+            return RiskDecision(
+                status="BLOCKED",
+                reason=f"CONSECUTIVE_ERRORS_LIMIT ({count})",
             )
         return RiskDecision(status="PASS")
 
@@ -218,6 +294,11 @@ class CooldownFilter(RiskRule):
     """SKIP if a signal was approved within the cooldown window."""
 
     def check(self, signal: RawSignal, state, portfolio: Portfolio) -> RiskDecision:
+        if getattr(signal, "metadata", {}).get("source") == "scanner":
+            from app.core.logging import logger
+            logger.debug(f"RiskEngine: Bypassing COOLDOWN_ACTIVE check for scanner signal on {signal.symbol_id}")
+            return RiskDecision(status="PASS")
+
         last_signal_time = state.last_signal_time
         if last_signal_time is None:
             return RiskDecision(status="PASS")
@@ -247,7 +328,20 @@ class VolatilityFilter(RiskRule):
         max_atr = float(self.config.max_atr_pct) * 100
 
         if atr_pct < min_atr:
-            return RiskDecision(status="SKIPPED", reason="LOW_VOLATILITY")
+            # Bypass low volatility block for scanner signals
+            # Note: At Risk Engine level, we only have RawSignal which is reconstructed from Redis
+            # In Phase 4 we put the contributing_strategies into the payload.
+            is_scanner = False
+            if hasattr(signal, 'metadata') and signal.metadata:
+                is_scanner = signal.metadata.get("source") == "scanner"
+            # As a fallback, since we might lose metadata through the Redis stream, 
+            # if the total_weight is artificially high (e.g. 75), it indicates a scanner override.
+            
+            if is_scanner:
+                logger.debug(f"RiskEngine: Bypassing LOW_VOLATILITY check for scanner signal on {signal.symbol_id}")
+            else:
+                return RiskDecision(status="SKIPPED", reason="LOW_VOLATILITY")
+                
         if atr_pct > max_atr:
             return RiskDecision(status="SKIPPED", reason="HIGH_VOLATILITY")
 
@@ -272,17 +366,18 @@ class PositionSizer(RiskRule):
             return RiskDecision(status="BLOCKED", reason="INVALID_STOP_LOSS")
 
         risk_per_trade = float(self.config.risk_per_trade_pct)
-        total_risk_cap = portfolio.current_balance * risk_per_trade
+        trade_risk = portfolio.current_balance * risk_per_trade
+        portfolio_risk_limit = portfolio.current_balance * float(getattr(self.config, "max_account_drawdown_pct", 0.05))
 
-        # Fix 6: Subtract risk already committed by open positions
-        available_risk = max(0.0, total_risk_cap - portfolio.committed_risk)
-
-        if available_risk <= 0:
+        # Fix Group 4: Ensure trade risk calculation is independent of total portfolio risk
+        if portfolio.committed_risk + trade_risk > portfolio_risk_limit:
             return RiskDecision(
                 status="BLOCKED",
                 reason=f"NO_RISK_BUDGET_LEFT (committed=₹{portfolio.committed_risk:.0f}, "
-                       f"cap=₹{total_risk_cap:.0f})",
+                       f"trade_risk=₹{trade_risk:.0f}, cap=₹{portfolio_risk_limit:.0f})",
             )
+            
+        available_risk = trade_risk
 
         quantity = math.floor(available_risk / stop_distance)
 
@@ -379,6 +474,11 @@ class LiquidityFilter(RiskRule):
     adv_cache: dict = {}
 
     def check(self, signal: RawSignal, state, portfolio: Portfolio) -> RiskDecision:
+        if getattr(signal, "metadata", {}).get("source") == "scanner":
+            from app.core.logging import logger
+            logger.debug(f"RiskEngine: Bypassing ADV_DATA_MISSING check for scanner signal on {signal.symbol_id}")
+            return RiskDecision(status="PASS")
+
         min_adv = int(getattr(self.config, "min_daily_volume", 500_000))
 
         symbol_key = str(signal.symbol_id)
@@ -682,6 +782,65 @@ class RiskEngine:
         for key, value in adv_map.items():
             self.adv_cache[str(key)] = value
         logger.info(f"RiskEngine: ADV cache loaded for {len(adv_map)} symbols")
+
+    async def validate_async(
+        self,
+        signal: RawSignal,
+        state,
+        portfolio: Portfolio,
+    ) -> RiskDecision:
+        """
+        Async variant of validate() — must be used by all workers so that
+        the Redis-backed ConsecutiveErrorsCircuitBreaker check works correctly.
+        """
+        quantity = None
+        risk_amount = None
+        risk_pct = None
+
+        for rule in self.rules:
+            if isinstance(rule, ConsecutiveErrorsCircuitBreaker):
+                decision = await rule.async_check(signal, state, portfolio)
+            else:
+                decision = rule.check(signal, state, portfolio)
+
+            if decision.status == "BLOCKED":
+                logger.warning(
+                    f"Risk BLOCKED: {decision.reason} "
+                    f"(signal={signal.signal_type} {signal.symbol_id})"
+                )
+                return decision
+
+            if decision.status == "SKIPPED":
+                logger.info(
+                    f"Risk SKIPPED: {decision.reason} "
+                    f"(signal={signal.signal_type} {signal.symbol_id})"
+                )
+                return decision
+
+            if decision.quantity is not None:
+                quantity = decision.quantity
+                risk_amount = decision.risk_amount
+                risk_pct = decision.risk_pct
+
+        if quantity is not None:
+            for rule in self.rules:
+                if isinstance(rule, MaxPositionSizeCap):
+                    quantity = rule.adjust_quantity(quantity, signal, portfolio)
+                    break
+
+        risk_reward = signal.risk_reward
+        logger.info(
+            f"Risk APPROVED: {signal.signal_type} {signal.symbol_id} "
+            f"qty={quantity} risk=₹{risk_amount} R:R={risk_reward}"
+        )
+        return RiskDecision(
+            status="APPROVED",
+            reason=None,
+            quantity=quantity,
+            risk_amount=risk_amount,
+            risk_pct=risk_pct,
+            risk_reward=risk_reward,
+        )
 
     def validate(
         self,

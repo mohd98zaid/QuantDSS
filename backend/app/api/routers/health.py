@@ -39,12 +39,47 @@ async def health_check():
 
     redis_ok = await check_redis_health()
 
+    from app.ingestion.broker_manager import broker_manager
+    active = broker_manager.get_active_broker()
+    broker_ok = False
+    if active:
+        try:
+            b_status = await active.get_connection_status()
+            broker_ok = b_status.get("status") == "CONNECTED"
+        except Exception:
+            pass
+
     status = "ok" if (db_ok and redis_ok) else "degraded"
     return {
         "status": status,
         "database": "ok" if db_ok else "error",
         "redis": "ok" if redis_ok else "error",
+        "broker": "ok" if broker_ok else "disconnected",
     }
+
+
+@router.get("/health/db")
+async def db_health():
+    """Database specific health check."""
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(sa_text("SELECT 1"))
+        return {"status": "ok", "message": "Database is reachable"}
+    except Exception as e:
+        return {"status": "error", "message": f"Database connection failed: {str(e)}"}
+
+
+@router.get("/health/redis")
+async def redis_health():
+    """Redis specific health check."""
+    try:
+        redis_ok = await check_redis_health()
+        if redis_ok:
+            return {"status": "ok", "message": "Redis is reachable"}
+        else:
+            return {"status": "error", "message": "Redis connection failed"}
+    except Exception as e:
+        return {"status": "error", "message": f"Redis connection error: {str(e)}"}
 
 
 @router.get("/health/broker")

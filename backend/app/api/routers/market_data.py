@@ -272,34 +272,3 @@ async def seed_intraday_candles(
         "source": "upstox_intraday",
         "instrument_key": sym.instrument_key or "not_set",
     }
-
-
-@router.get("/market-data/symbols")
-async def list_symbols_with_status(
-    db: AsyncSession = Depends(get_session),
-    _user: dict = Depends(get_current_user),
-):
-    """Return all active symbols with candle counts and instrument key status."""
-    result = await db.execute(select(Symbol).where(Symbol.is_active == True))  # noqa: E712
-    symbols = result.scalars().all()
-
-    # FIX #6: was N+1 (1 COUNT query per symbol). Now single GROUP BY query.
-    count_result = await db.execute(
-        select(Candle.symbol_id, func.count().label("cnt"))
-        .group_by(Candle.symbol_id)
-    )
-    count_map: dict[int, int] = {row.symbol_id: row.cnt for row in count_result.all()}
-
-    return [
-        {
-            "id": s.id,
-            "trading_symbol": s.trading_symbol,
-            "exchange": s.exchange,
-            "instrument_key": s.instrument_key,
-            "candle_count": count_map.get(s.id, 0),
-            "yf_ticker": _yf_ticker(s.trading_symbol),
-            "upstox_ready": bool(s.instrument_key),
-        }
-        for s in symbols
-    ]
-

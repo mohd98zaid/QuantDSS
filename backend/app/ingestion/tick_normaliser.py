@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from app.core.logging import logger
 from app.core.redis import publish
 from app.ingestion.broker_adapter import NormalisedTick
+from app.ingestion.tick_storage import write_tick
+import asyncio
 
 
 class TickNormaliser:
@@ -47,4 +49,8 @@ class TickNormaliser:
         })
 
         await publish(channel, message)
+        
+        # Fire and forget storage to Data Lake so we don't block ingestion
+        asyncio.create_task(write_tick(tick))
+        
         return True

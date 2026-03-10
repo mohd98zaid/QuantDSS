@@ -10,7 +10,7 @@ class Trade(Base):
     __tablename__ = "trades"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    signal_id = Column(Integer, ForeignKey("signals.id"), nullable=True)
+    signal_id = Column(Integer, nullable=True)
     symbol_id = Column(Integer, ForeignKey("symbols.id"), nullable=False)
     trade_date = Column(Date, nullable=False)
     entry_time = Column(DateTime(timezone=True))
@@ -29,7 +29,7 @@ class Trade(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
-    signal = relationship("Signal", back_populates="trades")
+    # signal relationship removed to prevent FK crash on startup
     symbol = relationship("Symbol", back_populates="trades")
 
     __table_args__ = (

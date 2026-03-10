@@ -169,3 +169,42 @@ export const executePaperTradeApi = (data: {
   stop_loss: number;
   target_price: number;
 }) => apiFetch<any>("/paper/execute", { method: "POST", body: JSON.stringify(data) });
+
+// Paper Trading — balance, positions, history, close, reset, export
+export const getPaperBalance = () =>
+  apiFetch<{ paper_balance: number }>("/paper/balance");
+export const getPaperPositions = () =>
+  apiFetch<any[]>("/paper/positions");
+export const getPaperHistory = () =>
+  apiFetch<any[]>("/paper/history");
+export const closePaperTrade = (tradeId: number, exitPrice: number) =>
+  apiFetch<any>(`/paper/close/${tradeId}?exit_price=${exitPrice}`, { method: "POST" });
+export const resetPaperData = () =>
+  apiFetch<any>("/paper/data", { method: "DELETE" });
+export const exportPaperTrades = () =>
+  fetch(`${API_BASE}/v1/paper/export`, {
+    headers: { Authorization: `Bearer ${getToken()}` },
+  });
+
+// Auto Trader — trading mode, halt, resume, close all
+export const getTradingMode = () =>
+  apiFetch<any>("/auto-trader/trading-mode");
+export const setTradingMode = (mode: string, confirm_live: boolean = false) =>
+  apiFetch<any>("/auto-trader/trading-mode", {
+    method: "POST",
+    body: JSON.stringify({ mode, confirm_live }),
+  });
+export const emergencyHalt = () =>
+  apiFetch<any>("/auto-trader/halt", { method: "POST" });
+export const resumeTrading = () =>
+  apiFetch<any>("/auto-trader/resume", { method: "POST" });
+export const killSwitchCloseAll = () =>
+  apiFetch<any>("/auto-trader/close-all", { method: "POST" });
+
+// Performance Analytics
+export const getEquityCurve = (days: number = 30) =>
+  apiFetch<any>(`/performance/equity-curve?days=${days}`);
+export const getDrawdown = (days: number = 30) =>
+  apiFetch<any>(`/performance/drawdown?days=${days}`);
+export const getPerformanceByStrategy = () =>
+  apiFetch<any[]>("/performance/by-strategy");

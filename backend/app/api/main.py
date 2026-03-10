@@ -22,8 +22,8 @@ from app.api.routers import (
     trades,
     paper,
     auto_trader,
-    admin,
     replay,
+    admin_kill_switch,
 )
 from app.core.config import settings
 from app.core.logging import logger
@@ -61,7 +61,6 @@ async def lifespan(app: FastAPI):
     import app.models.backtest_run       # noqa: F401
     import app.models.auto_trade_config  # noqa: F401
     import app.models.auto_trade_log     # noqa: F401
-    import app.models.executed_signal    # noqa: F401
 
     # Step 1: create all tables in their own committed transaction
     async with engine.begin() as conn:
@@ -351,6 +350,16 @@ async def lifespan(app: FastAPI):
             "(signal-engine, risk-engine, autotrader, trade-monitor)"
         )
 
+    # Start Global Circuit Breaker Loop
+    import asyncio
+    circuit_breaker_task = None
+    try:
+        from app.system.circuit_breakers import circuit_breaker_loop
+        circuit_breaker_task = asyncio.create_task(circuit_breaker_loop())
+        logger.info("Startup: Global Circuit Breaker Loop started")
+    except Exception as _e:
+        logger.warning(f"Startup: Global Circuit Breaker Loop failed (non-fatal): {_e}")
+
     yield
     # Shutdown
     # Stop CandidateSignalPool background task
@@ -359,6 +368,10 @@ async def lifespan(app: FastAPI):
         signal_pool.stop()
     except Exception as _e:
         pass
+
+    # Stop Circuit Breaker Loop
+    if circuit_breaker_task:
+        circuit_breaker_task.cancel()
 
     # Fix 5: Stop candle persister
     try:
@@ -397,8 +410,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+from app.core.tracing import init_tracing
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+init_tracing(service_name="quantdss-api")
+FastAPIInstrumentor.instrument_app(app)
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+import uuid
+import structlog
+from fastapi import Request
+
+@app.middleware("http")
+async def structlog_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
+    with structlog.contextvars.bound_contextvars(
+        request_id=request_id,
+        service_name="quantdss-api"
+    ):
+        response = await call_next(request)
+        return response
 
 # CORS middleware
 origins = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip() and origin.strip() != "*"]
@@ -429,5 +464,5 @@ app.include_router(market_data.router, prefix="/api/v1", tags=["Market Data Seed
 app.include_router(scanner.router, prefix="/api/v1", tags=["Signal Scanner"])
 app.include_router(paper.router, prefix="/api/v1/paper", tags=["Paper Trading"])
 app.include_router(auto_trader.router, prefix="/api/v1", tags=["Auto Trader"])
-app.include_router(admin.router, prefix="/api/v1", tags=["Admin"])
 app.include_router(replay.router, prefix="/api/v1/replay", tags=["Market Replay Engine"])
+app.include_router(admin_kill_switch.router, prefix="/api/v1", tags=["Admin: Trading Control"])

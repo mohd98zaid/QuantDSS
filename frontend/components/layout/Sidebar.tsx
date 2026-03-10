@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
+import { getMarketStatus } from '@/lib/api'
 
 const NAV_ITEMS = [
   { href: '/',             label: 'Dashboard',    icon: '📊' },
@@ -25,9 +26,7 @@ export function Sidebar() {
   useEffect(() => {
     async function fetchMarket() {
       try {
-        const res = await fetch('/api/v1/health/market')
-        if (!res.ok) throw new Error('fetch failed')
-        const data = await res.json()
+        const data = await getMarketStatus()
         setMarketOpen(data.is_open)
         setMarketTime(data.current_time_ist)
       } catch {

@@ -45,22 +45,29 @@ export default function SignalsPage() {
 
   const exportCsv = async () => {
     try {
-      const token =
-        typeof window !== "undefined"
-          ? localStorage.getItem("quantdss_token")
-          : null;
-      const headers: Record<string, string> = {};
-      if (token) headers["Authorization"] = `Bearer ${token}`;
+      if (!signals || signals.length === 0) return;
+      const headers = [
+        "Time", "Type", "Symbol", "Entry", "SL", "Target", "Qty", "R:R", "Status"
+      ];
+      
+      const rows = signals.map(sig => [
+        sig.timestamp ? new Date(sig.timestamp).toLocaleTimeString() : "",
+        sig.signal_type || "",
+        sig.symbol || "",
+        sig.entry_price || "",
+        sig.stop_loss || "",
+        sig.target_price || "",
+        sig.quantity || "",
+        sig.risk_reward || "",
+        sig.risk_status || ""
+      ]);
 
-      let url = `${process.env.NEXT_PUBLIC_API_URL || "/api"}/v1/signals/export`;
-      if (filter !== "ALL") {
-        url += `?status=${filter}`;
-      }
+      const csvContent = [
+        headers.join(","),
+        ...rows.map(row => row.join(","))
+      ].join("\n");
 
-      const response = await fetch(url, { headers });
-      if (!response.ok) throw new Error("Export failed");
-
-      const blob = await response.blob();
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
       const downloadUrl = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = downloadUrl;

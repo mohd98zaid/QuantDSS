@@ -27,6 +27,7 @@ from abc import ABC, abstractmethod
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.core.redis import redis_client
 
 
 class WorkerBase(ABC):
@@ -44,6 +45,7 @@ class WorkerBase(ABC):
     def __init__(self):
         self._running = True
         self._shutdown_event = asyncio.Event()
+        self._heartbeat_task = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -56,6 +58,19 @@ class WorkerBase(ABC):
 
     async def _run_lifecycle(self):
         """Full async lifecycle: setup → run → teardown."""
+        import uuid
+        import structlog
+        
+        # Phase 1: Structured Logging Context Binding
+        worker_id_str = str(uuid.uuid4())[:8]
+        structlog.contextvars.bind_contextvars(
+            service_name=self.NAME,
+            worker_id=worker_id_str
+        )
+        
+        from app.core.tracing import init_tracing
+        init_tracing(service_name=self.NAME, worker_id=worker_id_str)
+        
         # Register signal handlers
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -70,6 +85,9 @@ class WorkerBase(ABC):
         # Ensure DB tables exist (same as main.py lifespan)
         await self._init_database()
 
+        # Start heartbeat
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
         logger.info(f"[{self.NAME}] Initialization complete — entering main loop")
 
         try:
@@ -80,8 +98,24 @@ class WorkerBase(ABC):
             logger.exception(f"[{self.NAME}] Fatal error: {e}")
             sys.exit(1)
         finally:
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
             await self.teardown()
             logger.info(f"[{self.NAME}] Shut down gracefully")
+
+    async def _heartbeat_loop(self):
+        """Continuously publish worker heartbeat to Redis."""
+        from app.core.metrics import WORKER_UPTIME
+        import time
+        start_time = time.time()
+        
+        while self.is_running:
+            WORKER_UPTIME.labels(worker_name=self.NAME).set(time.time() - start_time)
+            try:
+                await redis_client.setex(f"worker_heartbeat:{self.NAME}", 10, "alive")
+            except Exception as e:
+                logger.debug(f"[{self.NAME}] Heartbeat failed: {e}")
+            await asyncio.sleep(5)
 
     def _signal_handler(self):
         """Handle SIGTERM/SIGINT for graceful shutdown."""

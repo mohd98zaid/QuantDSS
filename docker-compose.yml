@@ -19,7 +19,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     ports:
@@ -233,6 +233,30 @@ services:
       redis: { condition: service_healthy }
     volumes:
       - ./backend:/app
+
+  # ── Scanner Worker (Phase 12) ─────────────────────────────────────────────
+  scanner-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://quant:${DB_PASSWORD}@postgres:5432/quantdb
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      SCANNER_INTERVAL: "300"
+      SCANNER_ACTIVE_LISTS: "nifty50"
+    command: ["python", "-m", "app.workers.scanner_worker"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # ── Frontend ──────────────────────────────────────────────────────────────
   frontend:

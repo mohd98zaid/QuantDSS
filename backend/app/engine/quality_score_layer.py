@@ -107,6 +107,13 @@ class QualityScoreLayer:
         # Final evaluation
         signal.quality_score = score
         
+        # Override for scanner signals (user initiated, bypass quality block)
+        is_scanner = getattr(primary, "metadata", {}).get("source") == "scanner"
+        if is_scanner and score < self.threshold:
+            logger.debug(f"Quality Score Layer: Enhancing score for scanner-sourced signal on {signal.symbol_id}")
+            score = self.threshold
+            signal.quality_score = score
+            
         if score < self.threshold:
             logger.info(
                 f"Quality Score Layer: REJECTED {signal.signal_type} for symbol_id {signal.symbol_id}. "

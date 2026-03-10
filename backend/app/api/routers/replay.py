@@ -4,6 +4,7 @@ Replay API Router — Endpoints to manage the Market Replay Engine.
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, conlist
 
+from app.api.deps import get_current_user
 from app.replay.replay_controller import ReplayController, fetch_replay_summary
 from app.core.logging import logger
 
@@ -14,7 +15,10 @@ class ReplayStartRequest(BaseModel):
     replay_speed: int = 1
 
 @router.post("/start", status_code=200)
-async def start_replay(request: ReplayStartRequest):
+async def start_replay(
+    request: ReplayStartRequest,
+    _user: dict = Depends(get_current_user),
+):
     """
     Start a new Market Replay session.
     Requires TradingMode to be set to PAPER.
@@ -27,7 +31,7 @@ async def start_replay(request: ReplayStartRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/pause", status_code=200)
-async def pause_replay():
+async def pause_replay(_user: dict = Depends(get_current_user)):
     """Pause the current Market Replay session."""
     try:
         ReplayController.pause()
@@ -36,7 +40,7 @@ async def pause_replay():
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/resume", status_code=200)
-async def resume_replay():
+async def resume_replay(_user: dict = Depends(get_current_user)):
     """Resume a paused Market Replay session."""
     try:
         await ReplayController.resume()
@@ -45,7 +49,7 @@ async def resume_replay():
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/stop", status_code=200)
-async def stop_replay():
+async def stop_replay(_user: dict = Depends(get_current_user)):
     """Stop the current Market Replay session and return final metrics."""
     try:
         metrics = ReplayController.stop()
@@ -54,7 +58,7 @@ async def stop_replay():
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/status", status_code=200)
-async def get_replay_status():
+async def get_replay_status(_user: dict = Depends(get_current_user)):
     """Get the status and real-time metrics of the current Market Replay session."""
     try:
         return ReplayController.status()
@@ -62,7 +66,10 @@ async def get_replay_status():
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/summary/{session_id}", status_code=200)
-async def get_replay_summary(session_id: str):
+async def get_replay_summary(
+    session_id: str,
+    _user: dict = Depends(get_current_user),
+):
     """Fetch the final generated summary of paper trades for a completed replay session."""
     try:
         summary = await fetch_replay_summary(session_id)

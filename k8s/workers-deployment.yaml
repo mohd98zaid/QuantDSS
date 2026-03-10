@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-engine-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: signal-engine-worker
+  template:
+    metadata:
+      labels:
+        app: signal-engine-worker
+    spec:
+      containers:
+      - name: worker
+        image: quantdss/worker:latest
+        command: ["python", "-m", "app.workers.signal_engine_worker"]
+        envFrom:
+        - configMapRef:
+            name: quantdss-config
+        - secretRef:
+            name: quantdss-secrets
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-engine-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: risk-engine-worker
+  template:
+    metadata:
+      labels:
+        app: risk-engine-worker
+    spec:
+      containers:
+      - name: worker
+        image: quantdss/worker:latest
+        command: ["python", "-m", "app.workers.risk_engine_worker"]
+        envFrom:
+        - configMapRef:
+            name: quantdss-config
+        - secretRef:
+            name: quantdss-secrets
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autotrader-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: autotrader-worker
+  template:
+    metadata:
+      labels:
+        app: autotrader-worker
+    spec:
+      containers:
+      - name: worker
+        image: quantdss/worker:latest
+        command: ["python", "-m", "app.workers.autotrader_worker"]
+        envFrom:
+        - configMapRef:
+            name: quantdss-config
+        - secretRef:
+            name: quantdss-secrets
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-monitor-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trade-monitor-worker
+  template:
+    metadata:
+      labels:
+        app: trade-monitor-worker
+    spec:
+      containers:
+      - name: worker
+        image: quantdss/worker:latest
+        command: ["python", "-m", "app.workers.trade_monitor_worker"]
+        envFrom:
+        - configMapRef:
+            name: quantdss-config
+        - secretRef:
+            name: quantdss-secrets
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"

@@ -100,7 +100,7 @@ class BaseStrategy(ABC):
 
 
 # ── Backward-compat alias ──────────────────────────────────────────
-# Several modules (risk_engine, signal_pipeline, auto_trader_engine,
+# Several modules (risk_engine, auto_trader_engine,
 # alert_dispatcher, telegram_notifier, tests) import "RawSignal".
 # The class was renamed to CandidateSignal during Phase 1 refactoring
 # but the old name was never aliased, causing ImportError at startup.

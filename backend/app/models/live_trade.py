@@ -19,6 +19,9 @@ class LiveTrade(Base):
     stop_loss = Column(Float, nullable=False)
     target_price = Column(Float, nullable=False)
     
+    # Strategy assignment
+    strategy_id = Column(Integer, nullable=True, index=True)
+    
     # Actual broker order state
     broker_order_id = Column(String(100), nullable=True, index=True)
     filled_quantity = Column(Integer, default=0)

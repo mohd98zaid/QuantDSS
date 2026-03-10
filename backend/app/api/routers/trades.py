@@ -1,11 +1,12 @@
 """Trades router — Full trade journal implementation."""
 from datetime import UTC, date, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_session
+from app.core.rate_limit import limiter
 from app.models.audit_log import AuditLog
 from app.models.trade import Trade
 from app.schemas.trade import TradeCreate, TradeListResponse, TradeResponse, TradeSummary
@@ -49,7 +50,9 @@ async def list_trades(
 
 
 @router.post("/trades", response_model=TradeResponse, status_code=201)
+@limiter.limit("20/minute")
 async def create_trade(
+    request: Request,
     data: TradeCreate,
     db: AsyncSession = Depends(get_session),
     _user: dict = Depends(get_current_user),
@@ -100,7 +103,9 @@ async def create_trade(
 
 
 @router.put("/trades/{trade_id}", response_model=TradeResponse)
+@limiter.limit("20/minute")
 async def update_trade(
+    request: Request,
     trade_id: int,
     data: TradeCreate,
     db: AsyncSession = Depends(get_session),
@@ -132,7 +137,9 @@ async def update_trade(
 
 
 @router.delete("/trades/{trade_id}")
+@limiter.limit("10/minute")
 async def delete_trade(
+    request: Request,
     trade_id: int,
     db: AsyncSession = Depends(get_session),
     _user: dict = Depends(get_current_user),

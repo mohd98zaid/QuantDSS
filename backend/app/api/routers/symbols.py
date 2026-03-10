@@ -54,7 +54,7 @@ async def add_symbol(
         exchange=data.exchange.upper(),
     )
     db.add(symbol)
-    await db.flush()
+    await db.commit()
     await db.refresh(symbol)
     return symbol
 
@@ -72,3 +72,4 @@ async def remove_symbol(
         raise HTTPException(status_code=404, detail="Symbol not found")
 
     await db.delete(symbol)
+    await db.commit()

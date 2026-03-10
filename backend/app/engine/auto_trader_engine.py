@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_session_factory
 from app.core.logging import logger
+from app.core.redis_lock import redis_lock
 from app.engine.trading_mode import TradingModeController, TradingMode
 from app.models.auto_trade_config import AutoTradeConfig
 from app.models.auto_trade_log import AutoTradeLog
@@ -216,7 +217,11 @@ async def _close_trade(
     trade.closed_at = datetime.now(IST)
     trade.close_reason = "SIGNAL_EXIT"
     multiplier = 1 if trade.direction == "BUY" else -1
-    trade.realized_pnl = (exit_price - trade.entry_price) * trade.quantity * multiplier
+    
+    # Fix Group 7: Net PnL (deduct estimated slippage and fees)
+    gross_pnl = (exit_price - trade.entry_price) * trade.quantity * multiplier
+    cost = 40.0 + (trade.entry_price * trade.quantity * 0.0005)
+    trade.realized_pnl = gross_pnl - cost
     closed_pnl = float(trade.realized_pnl)
 
     # Return margin + PnL to balance (paper only)
@@ -280,6 +285,7 @@ async def _open_trade(
     strategy: str = "",
     timeframe: str = "",
     risk_engine_qty: int | None = None,  # Qty from RiskEngine (if pre-validated)
+    signal_id: str = "",                 # Fix 2: Passes down idempotency key
 ) -> bool:
     """
     Open a trade for the given signal, branching for PAPER vs LIVE execution.
@@ -377,9 +383,12 @@ async def _open_trade(
             signal_price=entry_price,
             stop_loss=stop_loss,
             target_price=target_price,
-            max_slippage_pct=cfg.max_slippage_pct
+            max_slippage_pct=cfg.max_slippage_pct,
+            signal_id=signal_id,
         )
-        if not trade:
+        if trade:
+            logger.info(f"DEBUG AutoTrader {symbol} LIVE order created: ID {trade.id} PENDING.")
+        else:
             print(f"DEBUG AutoTrader {symbol} LIVE order failed: ExecutionManager returned None.")
             return False
     else:
@@ -556,7 +565,7 @@ async def _process_batch(results: list[Any], strategy: str, timeframe: str) -> N
             if signal not in ("BUY", "SELL"):
                 continue
 
-            # ── 1. Try to close a reverse position first ──────────────
+            # ── 1. Try to close a reverse position first (no lock needed) ──
             was_closed, closed_pnl = await _close_trade(
                 db, cfg, r.symbol, signal,
                 exit_price=float(r.entry_price or 0),
@@ -574,7 +583,7 @@ async def _process_batch(results: list[Any], strategy: str, timeframe: str) -> N
                     current_pnl = float(today_risk_state.realised_pnl or 0)
                     today_risk_state.realised_pnl = round(current_pnl + closed_pnl, 2)
 
-            # ── 2. Try to open a new position ─────────────────────────
+            # ── 2. Try to open a new position ─────────────────────────────
             if slots_left <= 0:
                 _add_log(db, symbol=r.symbol, signal=signal, action="SKIP",
                          reason=f"Max positions reached ({open_count}/{cfg.max_open_positions})",
@@ -587,25 +596,66 @@ async def _process_batch(results: list[Any], strategy: str, timeframe: str) -> N
                          trend=r.trend)
                 continue
 
-            ok = await _open_trade(
-                db=db, cfg=cfg,
-                symbol=r.symbol,
-                signal=signal,
-                entry_price=float(r.entry_price or 0),
-                stop_loss=float(r.stop_loss or 0),
-                target_price=float(r.target_price or 0),
-                risk_state=today_risk_state,
-                portfolio=portfolio,
-                instrument_key=getattr(r, "instrument_key", ""),
-                risk_reward=float(r.risk_reward or 0),
-                rsi=float(r.rsi) if r.rsi is not None else None,
-                trend=r.trend,
-                strategy=strategy,
-                timeframe=timeframe,
-            )
-            if ok:
-                opened += 1
-                slots_left -= 1
+            # Fix Group 1 (V-01 / V-02): Distributed Portfolio Lock
+            # ─────────────────────────────────────────────────────
+            # Without this lock two concurrent workers (reactive + scheduled)
+            # both read the same portfolio state, both see N positions < limit,
+            # and both call _open_trade() — resulting in a duplicate position
+            # and risk-limit bypass. The lock serialises each trade-open attempt
+            # across ALL processes sharing the same Redis instance.
+            # TTL=30s: if the lock holder dies, the lock auto-expires in 30s.
+            try:
+                async with redis_lock("quantdss:portfolio_lock", timeout=30):
+                    # Re-check slot count INSIDE the lock with a fresh read
+                    open_count_now = await _count_open_trades(db)
+                    slots_now = cfg.max_open_positions - open_count_now
+                    if slots_now <= 0:
+                        logger.info(
+                            f"AutoTrader: Portfolio full (locked re-check — "
+                            f"{open_count_now}/{cfg.max_open_positions}). Skipping {r.symbol}."
+                        )
+                        continue
+
+                    # Fix 6: Execution Idempotency
+                    from app.core.redis import redis_client
+                    import hashlib
+                    # Generate a unique deterministic signal ID
+                    signal_str = f"{r.symbol}_{signal}_{strategy}_{timeframe}_{float(r.entry_price or 0)}"
+                    signal_id = hashlib.md5(signal_str.encode()).hexdigest()
+                    dedup_key = f"execution_dedup:{signal_id}"
+                    
+                    if await redis_client.exists(dedup_key):
+                        logger.info(f"AutoTrader: Idempotency execution check skipped duplicate signal {signal_id} for {r.symbol}.")
+                        continue
+                    
+                    ok = await _open_trade(
+                        db=db, cfg=cfg,
+                        symbol=r.symbol,
+                        signal=signal,
+                        entry_price=float(r.entry_price or 0),
+                        stop_loss=float(r.stop_loss or 0),
+                        target_price=float(r.target_price or 0),
+                        risk_state=today_risk_state,
+                        portfolio=portfolio,
+                        instrument_key=getattr(r, "instrument_key", ""),
+                        risk_reward=float(r.risk_reward or 0),
+                        rsi=float(r.rsi) if r.rsi is not None else None,
+                        trend=r.trend,
+                        strategy=strategy,
+                        timeframe=timeframe,
+                        signal_id=signal_id,  # Pass down to execution manager
+                    )
+                    if ok:
+                        # Set deduplication key on success with 1-hour TTL
+                        await redis_client.setex(dedup_key, 3600, "1")
+                        opened += 1
+                        slots_left -= 1
+                    await db.commit()
+            except TimeoutError:
+                logger.warning(
+                    f"AutoTrader: Could not acquire portfolio lock for {r.symbol} — skipping signal. "
+                    f"(Another worker is placing a trade right now.)"
+                )
 
         # Always commit so SKIP log entries are persisted for the Activity Log
         await db.commit()
@@ -729,150 +779,5 @@ async def run_auto_trader() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fix 11: AUTO SQUARE-OFF at 15:15 IST
+# EOF
 # ──────────────────────────────────────────────────────────────────────────────
-
-async def auto_square_off() -> None:
-    """
-    Fix 11: Mandatory intraday square-off at 15:15 IST.
-
-    NSE requires all intraday (MIS) positions to be closed before 15:30.
-    This function closes every OPEN trade (paper and live) using market orders,
-    recording the close reason as "AUTO_SQUAREOFF".
-
-    Wire this to APScheduler with a cron trigger at 15:15 IST:
-        from apscheduler.triggers.cron import CronTrigger
-        scheduler.add_job(
-            auto_square_off,
-            CronTrigger(hour=15, minute=15, timezone="Asia/Kolkata"),
-            id="auto_square_off",
-            replace_existing=True,
-        )
-
-    Paper trades: closed in-DB with last known price as exit (no broker call).
-    Live trades:  closed via ExecutionManager.place_market_close_order().
-    """
-    now_ist = datetime.now(IST)
-    logger.warning(
-        f"AutoTrader: AUTO SQUARE-OFF triggered at {now_ist.strftime('%H:%M:%S IST')}"
-    )
-
-    async with async_session_factory() as db:
-        try:
-            # ── Fetch config ────────────────────────────────────────────────
-            cfg = await _get_config(db)
-            trade_model = LiveTrade if (cfg and cfg.mode == "live") else PaperTrade
-
-            # ── Load all OPEN trades ────────────────────────────────────────
-            result = await db.execute(
-                select(trade_model).where(trade_model.status == "OPEN")
-            )
-            open_trades = result.scalars().all()
-
-            if not open_trades:
-                logger.info("AutoTrader: AUTO SQUARE-OFF — no open trades to close")
-                return
-
-            closed_count = 0
-            errors: list[str] = []
-
-            # ── Get execution manager for live close orders ─────────────────
-            mgr: ExecutionManager | None = None
-            if cfg and cfg.mode == "live":
-                mgr = ExecutionManager(db)
-
-            for trade in open_trades:
-                try:
-                    # For live trades, send market close order to broker
-                    if mgr is not None:
-                        ok = await mgr.place_market_close_order(trade)
-                        if not ok:
-                            errors.append(
-                                f"Live trade {trade.id} ({trade.symbol}): broker rejected market close"
-                            )
-                            logger.error(
-                                f"AutoTrader: AUTO SQUARE-OFF — market close REJECTED "
-                                f"for live trade {trade.id} ({trade.symbol})"
-                            )
-                            # Fix 5: Do NOT mark CLOSED if broker rejected the close order.
-                            # Mark SQUAREOFF_FAILED so the operator knows to intervene.
-                            trade.status = "SQUAREOFF_FAILED"
-                            trade.close_reason = "SQUAREOFF_FAILED"
-                            trade.closed_at = now_ist
-                            try:
-                                from app.core.notifier import notifier
-                                asyncio.create_task(notifier.send_alert(
-                                    title="🚨 Auto Square-Off FAILED",
-                                    message=(
-                                        f"CRITICAL: Market close order REJECTED by broker for "
-                                        f"{trade.symbol} (Trade {trade.id}).\n"
-                                        f"Position remains OPEN. Immediate manual intervention required!"
-                                    ),
-                                    level="CRITICAL",
-                                ))
-                            except Exception:
-                                pass
-                            continue  # do not count as closed
-
-                    # Fix 5: Only mark CLOSED for paper trades (no broker call) or
-                    # live trades where broker confirmed the close.
-                    trade.status = "CLOSED"
-                    trade.close_reason = "AUTO_SQUAREOFF"
-                    trade.closed_at = now_ist
-                    # Fix 9: Fetch current LTP instead of using entry_price for accurate PnL
-                    from app.ingestion.websocket_manager import market_data_cache
-                    ltp = market_data_cache.get_ltp(trade.instrument_key)
-                    if ltp and ltp > 0:
-                        trade.exit_price = ltp
-                        multiplier = 1 if trade.direction == "BUY" else -1
-                        trade.realized_pnl = round((ltp - (trade.entry_price or 0)) * trade.quantity * multiplier, 2)
-                    else:
-                        trade.exit_price = trade.entry_price
-                        trade.realized_pnl = 0.0
-
-                    closed_count += 1
-                    logger.info(
-                        f"AutoTrader: AUTO SQUARE-OFF — closed trade {trade.id} "
-                        f"({trade.symbol} {trade.direction}) @ exit=₹{trade.exit_price}"
-                    )
-
-                    # Notify strategy health monitor of the forced close
-                    _sid = getattr(trade, "strategy_id", None)
-                    if _sid and trade.realized_pnl is not None:
-                        try:
-                            from app.engine.strategy_health import strategy_health_monitor
-                            await strategy_health_monitor.record_trade_async(
-                                _sid, float(trade.realized_pnl), db
-                            )
-                        except Exception:
-                            pass
-
-                except Exception:
-                    logger.exception(
-                        f"AutoTrader: AUTO SQUARE-OFF — error closing trade {trade.id}"
-                    )
-
-            await db.commit()
-            logger.warning(
-                f"AutoTrader: AUTO SQUARE-OFF complete — "
-                f"{closed_count}/{len(open_trades)} trades closed, "
-                f"{len(errors)} error(s)"
-            )
-
-            # Dispatch alert
-            try:
-                from app.core.notifier import notifier
-                await notifier.send_alert(
-                    title="⏰ Auto Square-Off Complete (15:15 IST)",
-                    message=(
-                        f"Mandatory square-off at {now_ist.strftime('%H:%M IST')}.\\n"
-                        f"Closed: {closed_count} trade(s). Errors: {len(errors)}."
-                    ),
-                    level="WARNING" if not errors else "CRITICAL",
-                )
-            except Exception:
-                pass
-
-        except Exception:
-            logger.exception("AutoTrader: AUTO SQUARE-OFF failed with unhandled exception")
-

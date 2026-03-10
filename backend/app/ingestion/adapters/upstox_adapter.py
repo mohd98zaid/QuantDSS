@@ -128,3 +128,50 @@ class UpstoxAdapter(BrokerAdapter):
             "last_tick_at":        None,
         }
 
+    async def get_positions(self) -> list[dict]:
+        """Fetch open intraday positions from Upstox to assist with reconciliation."""
+        if not self.is_connected:
+            return []
+            
+        token = _fresh_token()
+        if not token:
+            return []
+            
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.get(
+                    "https://api.upstox.com/v2/portfolio/short-term-positions",
+                    headers=headers
+                )
+            
+            if res.status_code == 200:
+                positions = []
+                data = res.json().get("data", [])
+                for p in data:
+                    qty = int(p.get("quantity", p.get("net_quantity", p.get("day_sell_quantity", 0) - p.get("day_buy_quantity", 0)) or 0))
+                    # Fallback if net is specifically provided
+                    if "quantity" in p:
+                        qty = int(p["quantity"])
+                    elif "net_quantity" in p:
+                        qty = int(p["net_quantity"])
+                    
+                    if qty != 0:
+                        symbol = p.get("trading_symbol", p.get("tradingsymbol", p.get("symbol", "")))
+                        positions.append({
+                            "symbol": symbol,
+                            "quantity": abs(qty),
+                            "direction": "LONG" if qty > 0 else "SHORT"
+                        })
+                return positions
+            else:
+                logger.error(f"UpstoxAdapter get_positions failed HTTP {res.status_code}: {res.text[:100]}")
+        except Exception as e:
+            logger.error(f"UpstoxAdapter get_positions error: {e}")
+            
+        return []
+

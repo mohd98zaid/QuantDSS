@@ -39,14 +39,20 @@ class TelegramNotifier:
         try:
             bot = await self._get_bot()
             if bot:
-                await bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
-                return True
+                for attempt in range(3):
+                    try:
+                        await bot.send_message(
+                            chat_id=self.chat_id,
+                            text=text,
+                            parse_mode="HTML",
+                        )
+                        return True
+                    except Exception as e:
+                        logger.error(f"Telegram send failed attempt {attempt+1}: {e}")
+                        import asyncio
+                        await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
+            logger.error(f"Telegram bot initialization failed: {e}")
         return False
 
     async def send_signal_alert(
@@ -124,3 +130,17 @@ class TelegramNotifier:
             f"{pnl_emoji} Net P&L: ₹{net_pnl:.2f}\n"
         )
         return await self.send_message(text)
+
+telegram_notifier_instance = TelegramNotifier()
+
+def send_telegram_alert(message: str):
+    """
+    Fire and forget helper to send a telegram alert asynchronously.
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(telegram_notifier_instance.send_message(message))
+    except RuntimeError:
+        # If no running loop, we can't easily fire-and-forget without creating one.
+        pass

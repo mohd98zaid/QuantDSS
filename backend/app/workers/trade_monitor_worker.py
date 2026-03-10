@@ -112,6 +112,11 @@ class TradeMonitorWorker(WorkerBase):
 
                 eod = _is_eod()
 
+                from app.core.redis import redis_client
+                from app.system.trading_state import get_trading_state
+                trading_state = await get_trading_state(redis_client)
+                emergency_flatten = trading_state == "EMERGENCY_FLATTEN"
+
                 for trade in open_trades:
                     try:
                         # Get instrument_key if available
@@ -121,18 +126,23 @@ class TradeMonitorWorker(WorkerBase):
                         if ltp is None:
                             continue
 
-                        # EOD Square-off
-                        if eod:
-                            trade.exit_price = ltp
-                            trade.exit_time = datetime.now(timezone.utc)
-                            trade.status = "CLOSED"
-                            trade.exit_reason = "EOD_SQUAREOFF"
-                            pnl = self._calc_pnl(trade, ltp)
-                            trade.realised_pnl = pnl
-                            logger.info(
-                                f"[{self.NAME}] EOD square-off: {trade.symbol} @ ₹{ltp:.2f} "
-                                f"P&L=₹{pnl:.2f}"
-                            )
+                        # EOD Square-off or Emergency Flatten
+                        if eod or emergency_flatten:
+                            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+                            lock_reason = "eod" if eod else "emergency"
+                            lock_key = f"{lock_reason}_square_off_lock:paper:{trade.id}:{today_str}"
+                            if await redis_client.set(lock_key, "1", ex=3600, nx=True):
+                                trade.exit_price = ltp
+                                trade.exit_time = datetime.now(timezone.utc)
+                                trade.status = "CLOSED"
+                                trade.exit_reason = "EMERGENCY_FLATTEN" if emergency_flatten else "EOD_SQUAREOFF"
+                                pnl = self._calc_pnl(trade, ltp)
+                                trade.realised_pnl = pnl
+                                await self._add_to_daily_pnl(db, pnl)
+                                logger.info(
+                                    f"[{self.NAME}] Paper {lock_reason} square-off: {trade.symbol} @ ₹{ltp:.2f} "
+                                    f"P&L=₹{pnl:.2f}"
+                                )
                             continue
 
                         # Check SL hit
@@ -149,6 +159,7 @@ class TradeMonitorWorker(WorkerBase):
                             trade.exit_reason = "SL_HIT"
                             pnl = self._calc_pnl(trade, trade.stop_loss)
                             trade.realised_pnl = pnl
+                            await self._add_to_daily_pnl(db, pnl)
                             logger.info(
                                 f"[{self.NAME}] SL hit: {trade.symbol} @ ₹{trade.stop_loss:.2f} "
                                 f"P&L=₹{pnl:.2f}"
@@ -169,6 +180,7 @@ class TradeMonitorWorker(WorkerBase):
                             trade.exit_reason = "TARGET_HIT"
                             pnl = self._calc_pnl(trade, trade.target_price)
                             trade.realised_pnl = pnl
+                            await self._add_to_daily_pnl(db, pnl)
                             logger.info(
                                 f"[{self.NAME}] Target hit: {trade.symbol} "
                                 f"@ ₹{trade.target_price:.2f} P&L=₹{pnl:.2f}"
@@ -176,7 +188,7 @@ class TradeMonitorWorker(WorkerBase):
                             continue
 
                         # Trailing stop logic
-                        self._update_trailing_stop(trade, ltp)
+                        await self._update_trailing_stop(trade, ltp)
 
                     except Exception as e:
                         logger.exception(
@@ -203,6 +215,12 @@ class TradeMonitorWorker(WorkerBase):
                 if not open_trades:
                     return
 
+                # ── Global Kill Switch Check (Emergency Flatten) ──
+                from app.core.redis import redis_client
+                from app.system.trading_state import get_trading_state
+                trading_state = await get_trading_state(redis_client)
+                emergency_flatten = trading_state == "EMERGENCY_FLATTEN"
+
                 eod = _is_eod()
 
                 for trade in open_trades:
@@ -213,25 +231,43 @@ class TradeMonitorWorker(WorkerBase):
                         if ltp is None:
                             continue
 
-                        # EOD Square-off for live trades
-                        if eod:
-                            try:
-                                from app.engine.execution_manager import ExecutionManager
-                                mgr = ExecutionManager(db)
-                                # Fix Group 3: Use place_market_close_order instead of non-existent square_off_trade
-                                success = await mgr.place_market_close_order(trade)
-                                if success:
-                                    logger.info(f"[{self.NAME}] Live EOD square-off submitted: {trade.symbol}")
-                                else:
-                                    logger.error(f"[{self.NAME}] Live EOD square-off submission FAILED for {trade.symbol}")
-                            except Exception as e:
-                                logger.exception(
-                                    f"[{self.NAME}] Live EOD square-off exception for {trade.symbol}: {e}"
-                                )
+                        # EOD Square-off or Emergency Flatten for live trades
+                        if eod or emergency_flatten:
+                            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+                            lock_reason = "eod" if eod else "emergency"
+                            lock_key = f"{lock_reason}_square_off_lock:live:{trade.id}:{today_str}"
+                            if await redis_client.set(lock_key, "1", ex=3600, nx=True):
+                                try:
+                                    from app.engine.execution_manager import ExecutionManager
+                                    mgr = ExecutionManager(db)
+                                    # Use place_market_close_order instead of non-existent square_off_trade
+                                    success = await mgr.place_market_close_order(trade)
+                                    if success:
+                                        logger.info(f"[{self.NAME}] Live {lock_reason} square-off submitted: {trade.symbol}")
+                                    else:
+                                        logger.error(f"[{self.NAME}] Live {lock_reason} square-off submission FAILED for {trade.symbol}")
+                                        await redis_client.delete(lock_key)
+                                except Exception as e:
+                                    logger.exception(
+                                        f"[{self.NAME}] Live {lock_reason} square-off exception for {trade.symbol}: {e}"
+                                    )
+                                    await redis_client.delete(lock_key)
                             continue
 
                         # Fix Group 1: Fallback stop-loss monitor
                         if not trade.sl_order_id:
+                            # ADDITIONAL SAFETY IMPROVEMENT: Recreate missing SL
+                            logger.warning(f"[{self.NAME}] Missing SL for {trade.symbol}. Recreating protection order.")
+                            try:
+                                from app.engine.execution_manager import ExecutionManager
+                                mgr = ExecutionManager(db)
+                                new_sl = await mgr.place_sl_order(trade, trade.stop_loss)
+                                if new_sl:
+                                    trade.sl_order_id = new_sl
+                                    logger.info(f"[{self.NAME}] Successfully recreated SL for {trade.symbol}: {new_sl}")
+                            except Exception as e:
+                                logger.error(f"[{self.NAME}] Failed to recreate SL for {trade.symbol}: {e}")
+
                             local_sl_hit = False
                             if trade.direction == "BUY" and ltp <= trade.stop_loss:
                                 local_sl_hit = True
@@ -252,6 +288,9 @@ class TradeMonitorWorker(WorkerBase):
                                     logger.exception(f"[{self.NAME}] Local SL fallback exception for {trade.symbol}: {e}")
                                 continue
 
+                        # Fix Group 8: Apply real broker trailing stops
+                        await self._update_trailing_stop(trade, ltp, db)
+
                     except Exception as e:
                         logger.exception(
                             f"[{self.NAME}] Error checking live trade {trade.symbol}: {e}"
@@ -265,15 +304,31 @@ class TradeMonitorWorker(WorkerBase):
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _calc_pnl(self, trade, exit_price: float) -> float:
-        """Calculate realised P&L for a trade."""
+        """Calculate realised Net P&L for a trade including estimated fees."""
         qty = float(getattr(trade, "quantity", 1) or 1)
         if trade.direction == "BUY":
-            return round(float(exit_price - float(trade.entry_price)) * qty, 2)
+            gross_pnl = round(float(exit_price - float(trade.entry_price)) * qty, 2)
         else:
-            return round(float(float(trade.entry_price) - exit_price) * qty, 2)
+            gross_pnl = round(float(float(trade.entry_price) - exit_price) * qty, 2)
+            
+        # Fix Group 7: Net PnL circuit breakers (deduct costs per trade)
+        cost = 40.0 + (float(trade.entry_price) * qty * 0.0005)
+        return round(gross_pnl - cost, 2)
 
-    def _update_trailing_stop(self, trade, ltp: float):
-        """Update trailing stop if price has moved favorably."""
+    async def _add_to_daily_pnl(self, db, pnl: float) -> None:
+        """Add realised PnL to today's risk state."""
+        from datetime import date
+        from app.models.daily_risk_state import DailyRiskState
+        today = date.today()
+        result = await db.execute(select(DailyRiskState).where(DailyRiskState.trade_date == today))
+        state = result.scalar_one_or_none()
+        if state:
+            current_pnl = float(state.realised_pnl or 0.0)
+            state.realised_pnl = round(current_pnl + pnl, 2)
+
+    async def _update_trailing_stop(self, trade, ltp: float, db=None) -> None:
+        """Update trailing stop locally and via broker if price has moved favorably."""
+        from sqlalchemy.ext.asyncio import AsyncSession
         entry = trade.entry_price
         sl = trade.stop_loss
         initial_risk = abs(entry - sl)
@@ -281,32 +336,48 @@ class TradeMonitorWorker(WorkerBase):
         if initial_risk <= 0:
             return
 
+        new_sl = None
         if trade.direction == "BUY":
             profit_distance = ltp - entry
             trigger = initial_risk * TRAIL_TRIGGER_RATIO
 
             if profit_distance >= trigger:
-                new_sl = ltp - (initial_risk * TRAIL_DISTANCE_RATIO)
-                if new_sl > trade.stop_loss:
-                    old_sl = trade.stop_loss
-                    trade.stop_loss = round(float(new_sl), 2)
-                    logger.debug(
-                        f"[{self.NAME}] Trail SL: {trade.symbol} "
-                        f"₹{old_sl:.2f} → ₹{trade.stop_loss:.2f}"
-                    )
+                proposed_sl = ltp - (initial_risk * TRAIL_DISTANCE_RATIO)
+                if proposed_sl > trade.stop_loss:
+                    new_sl = proposed_sl
         else:  # SELL
             profit_distance = entry - ltp
             trigger = initial_risk * TRAIL_TRIGGER_RATIO
 
             if profit_distance >= trigger:
-                new_sl = ltp + (initial_risk * TRAIL_DISTANCE_RATIO)
-                if new_sl < trade.stop_loss:
-                    old_sl = trade.stop_loss
-                    trade.stop_loss = round(float(new_sl), 2)
-                    logger.debug(
-                        f"[{self.NAME}] Trail SL: {trade.symbol} "
-                        f"₹{old_sl:.2f} → ₹{trade.stop_loss:.2f}"
-                    )
+                proposed_sl = ltp + (initial_risk * TRAIL_DISTANCE_RATIO)
+                if proposed_sl < trade.stop_loss:
+                    new_sl = proposed_sl
+
+        if new_sl is not None:
+            old_sl = trade.stop_loss
+            trade.stop_loss = round(float(new_sl), 2)
+            logger.debug(
+                f"[{self.NAME}] Trail SL: {trade.symbol} "
+                f"₹{old_sl:.2f} → ₹{trade.stop_loss:.2f}"
+            )
+            # Fix Group 8: Broker trailing stop integration (Atomic Modification)
+            if db and hasattr(trade, "sl_order_id") and trade.sl_order_id:
+                try:
+                    from app.engine.execution_manager import ExecutionManager
+                    import asyncio
+                    mgr = ExecutionManager(db)
+                    success = False
+                    for attempt in range(1, 4):
+                        success = await mgr.modify_order(trade.sl_order_id, trade.stop_loss)
+                        if success:
+                            break
+                        await asyncio.sleep(1)
+                    
+                    if not success:
+                        logger.error(f"[{self.NAME}] Failed to modify broker trailing SL for {trade.symbol} after 3 attempts")
+                except Exception as e:
+                    logger.error(f"[{self.NAME}] Exception modifying broker trailing SL for {trade.symbol}: {e}")
 
     # ── Main Loop ────────────────────────────────────────────────────────────
 

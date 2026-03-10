@@ -6,6 +6,7 @@ import {
   getSymbols, getCandles, seedCandles,
 } from '@/lib/api'
 import { CandlestickChart, OHLCCandle } from '@/components/CandlestickChart'
+import { KillSwitchControl } from '@/components/KillSwitchControl'
 
 interface KPIData {
   todayPnl: number
@@ -115,6 +116,7 @@ export default function DashboardPage() {
   const [chartLoading, setChartLoading] = useState(false)
   const [autoSeeding, setAutoSeeding] = useState(false)
   const [seedMsg, setSeedMsg] = useState<string | null>(null)
+  const [sseConnected, setSseConnected] = useState(false)
   const sseRef = useRef<EventSource | null>(null)
 
   // ── Initial data load ─────────────────────────────────────────────────────
@@ -138,7 +140,7 @@ export default function DashboardPage() {
           isHalted: state.is_halted,
         })
       })
-      .catch(() => {})
+      .catch(() => { })
 
     // Load watchlist symbols
     getSymbols()
@@ -153,7 +155,7 @@ export default function DashboardPage() {
         setWatchlist(rows)
         setSelectedSymbol(syms[0].trading_symbol)
       })
-      .catch(() => {})
+      .catch(() => { })
   }, [])
 
   // ── Load candle data for watchlist rows ───────────────────────────────────
@@ -254,47 +256,67 @@ export default function DashboardPage() {
 
   // ── SSE live signal feed ──────────────────────────────────────────────────
   useEffect(() => {
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || '/api'
-    const token = typeof window !== 'undefined'
-      ? localStorage.getItem('quantdss_token')
-      : null
-    if (!token) return
+    let es: EventSource | null = null;
+    let retryTimeout: NodeJS.Timeout | null = null;
+    let retryDelay = 1000;
 
-    const es = new EventSource(`${apiBase}/v1/stream/signals?token=${token}`)
-    sseRef.current = es
+    const connect = () => {
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || '/api'
+      const token = typeof window !== 'undefined'
+        ? localStorage.getItem('quantdss_token')
+        : null
+      if (!token) return
 
-    // ⚠️ The backend sends NAMED events ("event: signal"), not plain "message".
-    // onmessage only fires for un-named events → must use addEventListener.
-    const handleSignal = (e: MessageEvent) => {
-      try {
-        const raw = JSON.parse(e.data)
-        // backend wraps in { type, timestamp, signal_type, symbol, ... }
-        const sig: SignalEvent = {
-          signal_type:  raw.signal_type  ?? raw.type,
-          symbol:       raw.symbol       ?? '—',
-          strategy:     raw.strategy     ?? '',
-          entry_price:  raw.entry_price  ?? 0,
-          stop_loss:    raw.stop_loss    ?? 0,
-          target_price: raw.target_price ?? 0,
-          risk_status:  raw.risk_status  ?? 'APPROVED',
-          risk_reward:  raw.risk_reward,
-          timestamp:    raw.timestamp    ?? new Date().toISOString(),
-        }
-        if (sig.signal_type === 'BUY' || sig.signal_type === 'SELL') {
-          setSignals((prev) => [sig, ...prev].slice(0, 50))
-        }
-      } catch {}
-    }
+      es = new EventSource(`${apiBase}/v1/stream/signals?token=${token}`)
+      sseRef.current = es
 
-    es.addEventListener('signal', handleSignal)
-    // heartbeat / connected — ignored but prevents console errors
-    es.addEventListener('connected', () => {})
-    es.addEventListener('heartbeat', () => {})
-    es.onerror = () => {} // suppress console noise on reconnect
+      es.onopen = () => {
+        setSseConnected(true)
+        retryDelay = 1000;
+      }
+
+      // ⚠️ The backend sends NAMED events ("event: signal")
+      const handleSignal = (e: MessageEvent) => {
+        try {
+          const raw = JSON.parse(e.data)
+          const sig: SignalEvent = {
+            signal_type: raw.signal_type ?? raw.type,
+            symbol: raw.symbol ?? '—',
+            strategy: raw.strategy ?? '',
+            entry_price: raw.entry_price ?? 0,
+            stop_loss: raw.stop_loss ?? 0,
+            target_price: raw.target_price ?? 0,
+            risk_status: raw.risk_status ?? 'APPROVED',
+            risk_reward: raw.risk_reward,
+            timestamp: raw.timestamp ?? new Date().toISOString(),
+          }
+          if (sig.signal_type === 'BUY' || sig.signal_type === 'SELL') {
+            setSignals((prev) => [sig, ...prev].slice(0, 50))
+          }
+        } catch { }
+      }
+
+      es.addEventListener('signal', handleSignal)
+      es.addEventListener('connected', () => setSseConnected(true))
+      es.addEventListener('heartbeat', () => setSseConnected(true))
+
+      es.onerror = () => {
+        console.warn(`Dashboard SSE disconnected, retrying in ${retryDelay}ms...`)
+        setSseConnected(false)
+        es?.close()
+        retryTimeout = setTimeout(() => {
+          retryDelay = Math.min(retryDelay * 2, 30000)
+          connect()
+        }, retryDelay)
+      }
+    };
+
+    connect()
 
     return () => {
-      es.removeEventListener('signal', handleSignal)
-      es.close()
+      if (retryTimeout) clearTimeout(retryTimeout)
+      setSseConnected(false)
+      es?.close()
     }
   }, [])
 
@@ -302,8 +324,8 @@ export default function DashboardPage() {
   const fmtPrice = (v: number | null) => v !== null ? `₹${v.toFixed(2)}` : '—'
   const fmtVol = (v: number) =>
     v > 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M`
-    : v > 1_000 ? `${(v / 1_000).toFixed(0)}K`
-    : v.toString()
+      : v > 1_000 ? `${(v / 1_000).toFixed(0)}K`
+        : v.toString()
 
   const totalSignals = kpi.signalsApproved + kpi.signalsBlocked + kpi.signalsSkipped
   const winRate = totalSignals > 0
@@ -361,41 +383,36 @@ export default function DashboardPage() {
           </div>
 
           {/* Market Status */}
-          <div className={`flex items-center gap-2 px-4 py-2 rounded-lg backdrop-blur-md border shadow-lg transition-all duration-300 ${
-            isOpen === null
-              ? 'bg-slate-900/60 border-slate-800 text-slate-400'
-              : isOpen
+          <div className={`flex items-center gap-2 px-4 py-2 rounded-lg backdrop-blur-md border shadow-lg transition-all duration-300 ${isOpen === null
+            ? 'bg-slate-900/60 border-slate-800 text-slate-400'
+            : isOpen
               ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
               : 'bg-red-950/30 border-red-500/30 text-red-400'
-          }`}>
-            <span className={`w-2.5 h-2.5 rounded-full shadow-[0_0_8px_rgba(0,0,0,0.5)] ${
-              isOpen === null ? 'bg-slate-600 animate-pulse'
+            }`}>
+            <span className={`w-2.5 h-2.5 rounded-full shadow-[0_0_8px_rgba(0,0,0,0.5)] ${isOpen === null ? 'bg-slate-600 animate-pulse'
               : isOpen ? 'bg-emerald-400 animate-pulse shadow-emerald-500/50'
-              : 'bg-red-500 shadow-red-500/50'
-            }`} />
+                : 'bg-red-500 shadow-red-500/50'
+              }`} />
             <span className="font-semibold text-sm tracking-wide">{isOpen === null ? '…' : isOpen ? 'Market Open' : 'Market Closed'}</span>
             {countdownLabel && <span className="text-xs font-medium opacity-80 ml-1 bg-black/20 px-2 py-0.5 rounded">· {countdownLabel}</span>}
           </div>
 
           {/* Broker Badge */}
-          <div className={`flex items-center gap-2 px-4 py-2 rounded-lg backdrop-blur-md border shadow-lg transition-all duration-300 ${
-            brokerInfo.adapter === 'upstox'
-              ? 'bg-blue-950/40 border-blue-500/30 text-blue-300'
-              : brokerInfo.adapter === 'angel_one'
+          <div className={`flex items-center gap-2 px-4 py-2 rounded-lg backdrop-blur-md border shadow-lg transition-all duration-300 ${brokerInfo.adapter === 'upstox'
+            ? 'bg-blue-950/40 border-blue-500/30 text-blue-300'
+            : brokerInfo.adapter === 'angel_one'
               ? 'bg-orange-950/40 border-orange-500/30 text-orange-300'
               : 'bg-slate-900/60 border-slate-800 text-slate-400'
-          }`}>
-            <span className={`w-2 h-2 rounded-full ${
-              brokerInfo.status === 'CONNECTED' ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.6)]' : 'bg-slate-600'
-            }`} />
+            }`}>
+            <span className={`w-2 h-2 rounded-full ${brokerInfo.status === 'CONNECTED' ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.6)]' : 'bg-slate-600'
+              }`} />
             <span className="capitalize font-semibold text-sm tracking-wide">{brokerInfo.adapter === 'none' ? 'No Broker' : brokerInfo.adapter}</span>
           </div>
 
           {/* System Health */}
           <div className="flex items-center gap-2 glass-panel rounded-lg px-4 py-2 hover:bg-slate-800/80 transition-colors">
-            <span className={`w-2 h-2 rounded-full ${
-              systemHealth === 'ok' ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.6)]' : 'bg-red-400 shadow-[0_0_8px_rgba(239,68,68,0.6)]'
-            }`} />
+            <span className={`w-2 h-2 rounded-full ${systemHealth === 'ok' ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.6)]' : 'bg-red-400 shadow-[0_0_8px_rgba(239,68,68,0.6)]'
+              }`} />
             <span className="text-sm font-semibold tracking-wide text-slate-300">System: {systemHealth}</span>
           </div>
         </div>
@@ -408,7 +425,7 @@ export default function DashboardPage() {
             className={`relative group overflow-hidden glass-card rounded-2xl p-6 ${card.bg}`}>
             {/* Hover subtle glow effect */}
             <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 rounded-2xl" />
-            
+
             <p className="text-xs text-slate-400 uppercase tracking-widest font-semibold mb-2">{card.label}</p>
             <p className={`text-4xl font-bold font-mono-nums tracking-tight ${card.color} drop-shadow-lg group-hover:scale-[1.02] transition-transform duration-300 origin-left`}>
               {card.value}
@@ -442,9 +459,8 @@ export default function DashboardPage() {
                   <button
                     key={row.id}
                     onClick={() => setSelectedSymbol(row.trading_symbol)}
-                    className={`w-full flex items-center justify-between px-5 py-4 text-left transition-all duration-200 hover:bg-slate-800/40 outline-none ${
-                      isSelected ? 'bg-blue-900/20 border-l-4 border-l-blue-500 shadow-[inset_0_0_20px_rgba(59,130,246,0.05)]' : 'border-l-4 border-l-transparent'
-                    }`}
+                    className={`w-full flex items-center justify-between px-5 py-4 text-left transition-all duration-200 hover:bg-slate-800/40 outline-none ${isSelected ? 'bg-blue-900/20 border-l-4 border-l-blue-500 shadow-[inset_0_0_20px_rgba(59,130,246,0.05)]' : 'border-l-4 border-l-transparent'
+                      }`}
                   >
                     <div>
                       <div className="flex items-center gap-2 mb-1">
@@ -507,13 +523,12 @@ export default function DashboardPage() {
 
           <div className="flex-1 p-5 relative">
             {seedMsg && (
-              <div className={`absolute top-4 left-1/2 -translate-x-1/2 z-10 text-xs px-4 py-2 rounded-full shadow-lg backdrop-blur-md border ${
-                seedMsg.startsWith('✅')
-                  ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-300'
-                  : seedMsg.startsWith('⚠️')
+              <div className={`absolute top-4 left-1/2 -translate-x-1/2 z-10 text-xs px-4 py-2 rounded-full shadow-lg backdrop-blur-md border ${seedMsg.startsWith('✅')
+                ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-300'
+                : seedMsg.startsWith('⚠️')
                   ? 'bg-red-950/80 border-red-500/30 text-red-400'
                   : 'bg-blue-950/80 border-blue-500/30 text-blue-300'
-              }`}>
+                }`}>
                 {seedMsg}
               </div>
             )}
@@ -550,9 +565,15 @@ export default function DashboardPage() {
         <div className="lg:col-span-2 glass-panel rounded-2xl overflow-hidden flex flex-col h-[350px]">
           <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800/60 bg-slate-900/40">
             <h2 className="text-sm font-semibold text-slate-200 tracking-wide uppercase">Live Signal Feed</h2>
-            <div className="flex items-center gap-2 text-xs font-semibold tracking-wide text-emerald-400 bg-emerald-950/30 px-3 py-1.5 rounded-full border border-emerald-500/20 shadow-[0_0_10px_rgba(16,185,129,0.1)]">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]" />
-              SSE Connected
+            <div className={`flex items-center gap-2 text-xs font-semibold tracking-wide px-3 py-1.5 rounded-full border shadow-[0_0_10px_rgba(16,185,129,0.1)] transition-all duration-300 ${sseConnected
+              ? 'text-emerald-400 bg-emerald-950/30 border-emerald-500/20'
+              : 'text-slate-500 bg-slate-900/30 border-slate-700/50'
+              }`}>
+              <span className={`w-2 h-2 rounded-full ${sseConnected
+                ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]'
+                : 'bg-slate-600'
+                }`} />
+              {sseConnected ? 'SSE Connected' : 'SSE Connecting…'}
             </div>
           </div>
 
@@ -565,19 +586,17 @@ export default function DashboardPage() {
           ) : (
             <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent divide-y divide-slate-800/40">
               {signals.map((sig, i) => (
-                <div key={i} className={`flex items-center justify-between px-6 py-4 text-sm transition-all hover:bg-slate-800/40 ${
-                  sig.risk_status === 'APPROVED'
-                    ? 'border-l-4 border-l-emerald-500 bg-emerald-950/5'
-                    : sig.risk_status === 'BLOCKED'
+                <div key={i} className={`flex items-center justify-between px-6 py-4 text-sm transition-all hover:bg-slate-800/40 ${sig.risk_status === 'APPROVED'
+                  ? 'border-l-4 border-l-emerald-500 bg-emerald-950/5'
+                  : sig.risk_status === 'BLOCKED'
                     ? 'border-l-4 border-l-red-500 bg-red-950/5'
                     : 'border-l-4 border-l-yellow-500 bg-yellow-950/5'
-                }`}>
+                  }`}>
                   <div className="flex items-center gap-4">
-                    <span className={`font-bold text-xs px-3 py-1 rounded-md tracking-wider shadow-sm ${
-                      sig.signal_type === 'BUY'
-                        ? 'bg-gradient-to-br from-emerald-500/20 to-emerald-600/20 text-emerald-400 border border-emerald-500/30'
-                        : 'bg-gradient-to-br from-red-500/20 to-red-600/20 text-red-400 border border-red-500/30'
-                    }`}>{sig.signal_type}</span>
+                    <span className={`font-bold text-xs px-3 py-1 rounded-md tracking-wider shadow-sm ${sig.signal_type === 'BUY'
+                      ? 'bg-gradient-to-br from-emerald-500/20 to-emerald-600/20 text-emerald-400 border border-emerald-500/30'
+                      : 'bg-gradient-to-br from-red-500/20 to-red-600/20 text-red-400 border border-red-500/30'
+                      }`}>{sig.signal_type}</span>
                     <span className="font-bold text-slate-100 tracking-wide">{sig.symbol}</span>
                     <span className="text-slate-500 text-[11px] uppercase font-bold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700/50">{sig.strategy}</span>
                   </div>
@@ -594,17 +613,21 @@ export default function DashboardPage() {
                       <span className="text-slate-400 text-[10px] uppercase mb-0.5">Stop</span>
                       <span className="text-red-400 drop-shadow-sm">₹{sig.stop_loss?.toFixed(2)}</span>
                     </div>
-                    
-                    <span className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border shadow-sm ml-2 ${
-                      sig.risk_status === 'APPROVED' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+
+                    <span className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border shadow-sm ml-2 ${sig.risk_status === 'APPROVED' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
                       : sig.risk_status === 'BLOCKED' ? 'bg-red-500/10 text-red-400 border-red-500/30'
-                      : 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30'
-                    }`}>{sig.risk_status}</span>
+                        : 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30'
+                      }`}>{sig.risk_status}</span>
                   </div>
                 </div>
               ))}
             </div>
           )}
+        </div>
+
+        {/* Kill Switch Panel */}
+        <div className="lg:col-span-3">
+          <KillSwitchControl />
         </div>
 
         {/* Risk Panel */}
@@ -613,15 +636,14 @@ export default function DashboardPage() {
             <h2 className="text-sm font-semibold text-slate-200 tracking-wide uppercase">Risk Monitor</h2>
           </div>
           <div className="p-6 space-y-5 flex-1 flex flex-col justify-center">
-            
+
             <div className="space-y-4">
               <div className="flex items-center justify-between group">
                 <span className="text-xs text-slate-500 uppercase tracking-widest font-semibold group-hover:text-slate-400 transition-colors">Status</span>
-                <span className={`text-sm font-bold tracking-wide px-3 py-1 rounded-md border shadow-sm ${
-                  kpi.isHalted 
-                    ? 'bg-red-500/10 text-red-400 border-red-500/30' 
-                    : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                }`}>
+                <span className={`text-sm font-bold tracking-wide px-3 py-1 rounded-md border shadow-sm ${kpi.isHalted
+                  ? 'bg-red-500/10 text-red-400 border-red-500/30'
+                  : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                  }`}>
                   {kpi.isHalted ? 'HALTED' : 'ACTIVE'}
                 </span>
               </div>
@@ -631,7 +653,7 @@ export default function DashboardPage() {
                   {kpi.todayPnl >= 0 ? '+' : ''}₹{kpi.todayPnl.toFixed(2)}
                 </span>
               </div>
-              
+
               <div className="flex gap-2 pt-2">
                 <div className="flex-1 bg-slate-800/50 rounded-lg p-3 border border-slate-700/50 flex flex-col items-center">
                   <span className="text-[10px] text-slate-500 uppercase font-bold mb-1">Approved</span>
@@ -662,7 +684,7 @@ export default function DashboardPage() {
                 </div>
               </div>
             </div>
-            
+
           </div>
         </div>
       </div>

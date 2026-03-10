@@ -188,6 +188,22 @@ async def consume_stream(
                         logger.exception(
                             f"Consumer '{consumer}' error processing {msg_id} on {stream}: {e}"
                         )
+                        # DLQ Logic: Track failures and move poison-pill messages
+                        retry_key = f"retry_count:{stream}:{msg_id}"
+                        try:
+                            retry_count = await redis_client.incr(retry_key)
+                            if retry_count == 1:
+                                await redis_client.expire(retry_key, 86400) # expire in 24h
+                                
+                            if retry_count > 5:
+                                logger.error(f"Message {msg_id} exceeded retry limit. Sending to DLQ: signals:dlq")
+                                data["original_stream"] = stream
+                                data["error_message"] = str(e)
+                                await publish_to_stream("signals:dlq", data)
+                                await redis_client.xack(stream, group, msg_id)
+                                await redis_client.delete(retry_key)
+                        except Exception as dlq_err:
+                            logger.error(f"Failed to process DLQ for {msg_id}: {dlq_err}")
 
         except asyncio.CancelledError:
             logger.info(f"Consumer '{consumer}' on '{stream}' cancelled — exiting")

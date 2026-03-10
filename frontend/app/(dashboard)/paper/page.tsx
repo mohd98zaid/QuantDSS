@@ -1,6 +1,36 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import React, { useEffect, useState, Component, ErrorInfo, ReactNode } from 'react'
+
+class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean, error: Error | null}> {
+  constructor(props: {children: ReactNode}) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("ErrorBoundary caught:", error, errorInfo);
+    try {
+      fetch('http://localhost:8000/api/v1/health/broker?telemetry_err=' + encodeURIComponent(error.message));
+      fetch('/api/v1/health/broker?telemetry_err=' + encodeURIComponent(error.message));
+    } catch(e) {}
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-8 text-red-400 font-mono text-sm max-w-full overflow-auto">
+          <h1 className="text-xl font-bold mb-4">React Render Crash</h1>
+          <pre>{this.state.error?.message}</pre>
+          <pre className="mt-4">{this.state.error?.stack}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -126,7 +156,8 @@ export default function PaperTradePage() {
   }
 
   return (
-    <div className="p-8 max-w-7xl mx-auto space-y-8">
+    <ErrorBoundary>
+      <div className="p-8 max-w-7xl mx-auto space-y-8">
       <div>
         <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-500">
           Paper Trading
@@ -159,7 +190,7 @@ export default function PaperTradePage() {
           </div>
           <div>
             <div className="text-3xl font-mono font-semibold text-white">
-              ₹ {balance.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+              ₹ {(Number(balance) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
             </div>
             <p className="text-xs text-blue-400 mt-2">Dummy Capital starting at 1Lakh</p>
           </div>
@@ -168,7 +199,7 @@ export default function PaperTradePage() {
 
       <div className="space-y-4">
         <h2 className="text-xl font-semibold text-white border-b border-gray-800 pb-2">Active Positions</h2>
-        {positions.length === 0 ? (
+        {!positions || positions.length === 0 ? (
           <p className="text-gray-500 py-4 italic">No active virtual positions. Go to the Scanner and click "Paper Trade".</p>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-gray-800">
@@ -185,21 +216,21 @@ export default function PaperTradePage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800">
-                {positions.map(pos => (
+                 {(positions || []).map(pos => pos && (
                   <tr key={pos.id} className="hover:bg-surface-800/50 transition-colors">
-                    <td className="px-4 py-3 font-medium text-white">{pos.symbol}</td>
+                    <td className="px-4 py-3 font-medium text-white">{pos.symbol || 'UNKNOWN'}</td>
                     <td className="px-4 py-3">
                       <span className={`px-2 py-0.5 rounded-md text-xs font-bold ${pos.direction === 'BUY' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-800' : 'bg-red-500/10 text-red-400 border border-red-800'}`}>
-                        {pos.direction}
+                        {pos.direction || '-'}
                       </span>
                     </td>
-                    <td className="px-4 py-3 font-mono text-gray-300 text-right">{pos.quantity}</td>
-                    <td className="px-4 py-3 font-mono text-gray-300 text-right">₹{pos.entry_price.toFixed(2)}</td>
-                    <td className="px-4 py-3 font-mono text-red-400 text-right">₹{pos.stop_loss.toFixed(2)}</td>
-                    <td className="px-4 py-3 font-mono text-emerald-400 text-right">₹{pos.target_price.toFixed(2)}</td>
+                    <td className="px-4 py-3 font-mono text-gray-300 text-right">{pos.quantity || 0}</td>
+                    <td className="px-4 py-3 font-mono text-gray-300 text-right">₹{(pos.entry_price || 0).toFixed(2)}</td>
+                    <td className="px-4 py-3 font-mono text-red-400 text-right">₹{(pos.stop_loss || 0).toFixed(2)}</td>
+                    <td className="px-4 py-3 font-mono text-emerald-400 text-right">₹{(pos.target_price || 0).toFixed(2)}</td>
                     <td className="px-4 py-3 text-center">
                       <button 
-                        onClick={() => manualClose(pos.id, pos.direction === 'BUY' ? pos.target_price*0.99 : pos.target_price*1.01)}
+                        onClick={() => manualClose(pos.id, pos.direction === 'BUY' ? (pos.target_price || 0)*0.99 : (pos.target_price || 0)*1.01)}
                         className="text-xs px-3 py-1 bg-surface-700 hover:bg-gray-600 rounded text-red-400 transition"
                       >
                         Force Exit
@@ -215,7 +246,7 @@ export default function PaperTradePage() {
       
       <div className="space-y-4">
         <h2 className="text-xl font-semibold text-white border-b border-gray-800 pb-2">Trade History</h2>
-        {history.length === 0 ? (
+        {!history || history.length === 0 ? (
           <p className="text-gray-500 py-4 italic">No completed trades yet.</p>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-gray-800">
@@ -230,18 +261,20 @@ export default function PaperTradePage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800">
-                {history.map(pos => (
+                 {(history || []).map(pos => pos && (
                    <tr key={pos.id} className="hover:bg-surface-800/50 transition-colors">
-                   <td className="px-4 py-3 font-medium text-gray-300">{pos.symbol}({pos.direction})</td>
+                   <td className="px-4 py-3 font-medium text-gray-300">{(pos.symbol || 'UNKNOWN')}({pos.direction || '-'})</td>
                     <td className="px-4 py-3">
-                      <span className={`px-2 py-0.5 rounded-md text-xs font-bold ${pos.realized_pnl > 0 ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/50" : "bg-red-500/10 text-red-400 border border-red-500/50"}`}>
-                        {pos.realized_pnl > 0 ? 'WIN' : 'LOSS'}
+                      <span className={`px-2 py-0.5 rounded-md text-xs font-bold ${(pos.realized_pnl || 0) > 0 ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/50" : "bg-red-500/10 text-red-400 border border-red-500/50"}`}>
+                        {(pos.realized_pnl || 0) > 0 ? 'WIN' : 'LOSS'}
                       </span>
                     </td>
-                   <td className="px-4 py-3 font-mono text-gray-400 text-right">₹{pos.entry_price.toFixed(2)}</td>
-                   <td className="px-4 py-3 font-mono text-gray-400 text-right">₹{pos.exit_price?.toFixed(2)}</td>
-                   <td className={`px-4 py-3 font-mono text-right ${pos.realized_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                     {pos.realized_pnl >= 0 ? '+' : ''}₹{pos.realized_pnl.toFixed(2)}
+                   <td className="px-4 py-3 font-mono text-gray-400 text-right">₹{(pos.entry_price || 0).toFixed(2)}</td>
+                   <td className="px-4 py-3 font-mono text-gray-400 text-right">
+                     {pos.exit_price !== null && pos.exit_price !== undefined ? `₹${Number(pos.exit_price).toFixed(2)}` : '-'}
+                   </td>
+                   <td className={`px-4 py-3 font-mono text-right ${(pos.realized_pnl || 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                     {(pos.realized_pnl || 0) >= 0 ? '+' : ''}₹{(pos.realized_pnl || 0).toFixed(2)}
                    </td>
                  </tr>
                 ))}
@@ -251,6 +284,7 @@ export default function PaperTradePage() {
         )}
       </div>
 
-    </div>
+      </div>
+    </ErrorBoundary>
   )
 }

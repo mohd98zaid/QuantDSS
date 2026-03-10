@@ -31,6 +31,7 @@ from app.models.daily_risk_state import DailyRiskState
 from app.models.risk_config import RiskConfig
 from app.models.signal import Signal as SignalModel
 from app.workers.base import WorkerBase
+from app.engine.risk_reservation import reserve_risk, get_total_reserved_risk
 
 
 from app.core.redis_lock import redis_lock
@@ -123,23 +124,46 @@ class RiskEngineWorker(WorkerBase):
 
     # ── Signal Handler ───────────────────────────────────────────────────────
 
-    async def _handle_signal(self, msg_id: str, data: dict[str, str]):
-        """Process an approved signal through the risk engine."""
-        symbol_id = int(data.get("symbol_id", "0"))
+    async def _process_signal(self, msg_id: str, data: dict[str, str]):
+        """Process an incoming candidate signal through the RiskEngine."""
+        import structlog
+        from app.core.metrics import SIGNALS_REJECTED
+        
         symbol_name = data.get("symbol_name", "")
-        signal_type = data.get("signal_type", "")
-        entry_price = float(data.get("entry_price", "0"))
-        stop_loss = float(data.get("stop_loss", "0"))
-        target_price = float(data.get("target_price", "0"))
-        atr_value = float(data.get("atr_value", "0"))
-        candle_time_str = data.get("candle_time", "")
-        contributing_strategies = data.get("contributing_strategies", "[]")
-        quality_score = data.get("quality_score", "0")
+        trace_id = data.get("_trace_id") or msg_id
+        strategy = data.get("contributing_strategies", "")
+        
+        with structlog.contextvars.bound_contextvars(
+            symbol=symbol_name,
+            signal_id=trace_id,
+            strategy=strategy
+        ):
+            local_logger = logger.bind()
+        
+        try:
+            symbol_id = int(data["symbol_id"])
+            signal_type = data["signal_type"]
+            entry_price = float(data["entry_price"])
+            stop_loss = float(data["stop_loss"])
+            target_price = float(data["target_price"])
+            atr_value = float(data["atr_value"])
+            candle_time = datetime.fromisoformat(data["candle_time"]) if "candle_time" in data and data["candle_time"] else datetime.now(timezone.utc)
+            contributing_strategies = json.loads(data.get("contributing_strategies", "[]"))
+            quality_score = data.get("quality_score", "0") # Keep this as string for now, convert later if needed
+        except KeyError as e:
+            local_logger.error(f"[{self.NAME}] Invalid signal message (missing {e})")
+            return
+        except ValueError as e:
+            local_logger.error(f"[{self.NAME}] Invalid signal message values: {e}")
+            return
 
-        candle_time = (
-            datetime.fromisoformat(candle_time_str) if candle_time_str
-            else datetime.now(timezone.utc)
-        )
+        # Fix Group 5: Stale Signal Rejection
+        is_replay = data.get("is_replay", "").lower() in ("true", "1", "yes")
+        if not is_replay:
+            age = (datetime.now(timezone.utc) - candle_time).total_seconds()
+            if age > 300:  # Allow up to 5 mins in Risk Engine queue for potential slight delays, but 60s in AutoTrader is strict. Wait, let's just use 300 to match task.md if there's a backup. The user said 300 in task.md, let's use 300.
+                logger.warning(f"[{self.NAME}] Stale signal discarded (age: {age:.1f}s > 300s) for {symbol_name} {signal_type}")
+                return
 
         # Reconstruct a RawSignal for the risk engine
         raw_signal = RawSignal(
@@ -154,37 +178,40 @@ class RiskEngineWorker(WorkerBase):
             candle_time=candle_time,
             symbol_name=symbol_name,
         )
+        
+        is_scanner = data.get("is_scanner", "").lower() in ("true", "1", "yes")
+        if is_scanner:
+            raw_signal.metadata = {"source": "scanner"}
 
         async with async_session_factory() as db:
             try:
-                # ── DISTRIBUTED LOCK FOR RISK EVALUATION (Fix Group 5) ──
-                # This ensures only one worker assesses portfolio risk at a time for this symbol
-                async with redis_lock(f"risk_eval:{symbol_name}", timeout=2):
+                # ── DISTRIBUTED LOCK FOR RISK EVALUATION (Fix Group 3) ──
+                # This ensures only one worker assesses portfolio risk at a time to enforce global limits
+                async with redis_lock("risk_eval:portfolio", timeout=5):
                     portfolio = await self._load_portfolio(db)
-                    
                     # Fix Group 5: Risk Reservation Concurrency Injection
-                    from app.core.redis import redis_client
+                    total_reserved_risk, reversed_notionals = await get_total_reserved_risk()
                     
-                    # Read all expiring reservations
-                    res_keys = await redis_client.keys("risk_reservation:*")
-                    if res_keys:
-                        for key in res_keys:
-                            try:
-                                res_val = await redis_client.get(key)
-                                if res_val:
-                                    res_data = json.loads(res_val.decode() if isinstance(res_val, bytes) else res_val)
-                                    portfolio.open_positions += 1
-                                    portfolio.committed_risk += float(res_data.get("risk_amount", 0))
-                                    portfolio.open_position_values.append(float(res_data.get("notional", 0)))
-                            except Exception as e:
-                                logger.warning(f"Failed to parse risk reservation {key}: {e}")
-
+                    if total_reserved_risk > 0:
+                        portfolio.open_positions += len(reversed_notionals)
+                        portfolio.committed_risk += total_reserved_risk
+                        portfolio.open_position_values.extend(reversed_notionals)
+                        
                     state = await self._load_daily_state(db)
 
                     # Run risk validation
                     decision: RiskDecision = self._risk_engine.validate(
                         raw_signal, state, portfolio,
                     )
+
+                    try:
+                        from app.alerts.telegram_notifier import telegram_notifier_instance
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(telegram_notifier_instance.send_signal_alert(
+                            raw_signal, decision, symbol_name, contributing_strategies
+                        ))
+                    except RuntimeError:
+                        pass
 
                     if decision.status == "APPROVED":
                         # Publish to signals:risk_passed
@@ -203,14 +230,15 @@ class RiskEngineWorker(WorkerBase):
                         new_risk = decision.risk_amount or 0.0
                         
                         trace_id = data.get("_trace_id") or str(uuid.uuid4())
-                        res_data = {
-                            "symbol": symbol_name,
-                            "quantity": new_qty,
-                            "notional": new_notional,
-                            "risk_amount": new_risk,
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        }
-                        await redis_client.setex(f"risk_reservation:{trace_id}", 120, json.dumps(res_data))
+                        
+                        if new_risk > 0:
+                            await reserve_risk(
+                                signal_id=trace_id, 
+                                symbol=symbol_name, 
+                                risk_amount=new_risk, 
+                                quantity=new_qty, 
+                                notional=new_notional
+                            )
 
                         pub_id = await publish_to_stream(STREAM_SIGNALS_RISK_PASSED, message)
 
@@ -219,17 +247,27 @@ class RiskEngineWorker(WorkerBase):
                         state.last_signal_time = datetime.now(timezone.utc)
                         await db.commit()
 
-                        logger.info(
+                        local_logger.info(
                             f"[{self.NAME}] ✅ Risk APPROVED: {symbol_name} {signal_type} "
-                            f"qty={decision.quantity} → {STREAM_SIGNALS_RISK_PASSED} (id={pub_id})"
+                            f"qty={decision.quantity} → {STREAM_SIGNALS_RISK_PASSED}"
                         )
                     else:
                         # Log rejection
                         status_label = decision.status  # BLOCKED or SKIPPED
                         reason = decision.reason or "unknown"
+                        
+                        SIGNALS_REJECTED.labels(reason=status_label).inc()
 
                         if status_label == "BLOCKED":
                             state.signals_blocked = (state.signals_blocked or 0) + 1
+                            if "CONSECUTIVE_ERRORS_LIMIT" in str(reason):
+                                from app.engine.risk_engine import _send_deduped_alert
+                                _send_deduped_alert(
+                                    title="Circuit Breaker HALT",
+                                    message=f"System halted due to API errors: {reason}.\nManual intervention required.",
+                                    level="CRITICAL",
+                                    key="api_errors_halt"
+                                )
                         else:
                             state.signals_skipped = (state.signals_skipped or 0) + 1
                         await db.commit()

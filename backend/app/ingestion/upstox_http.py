@@ -246,3 +246,30 @@ class UpstoxHTTPClient:
             if ltp is not None:
                 result[key] = float(ltp)
         return result
+
+    async def get_open_orders(self) -> list[dict]:
+        """
+        Fetch all open orders from Upstox API.
+        Returns a list of order dicts.
+        """
+        url = f"{UPSTOX_BASE}/v2/order/retrieve-all"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, headers=self._headers())
+
+            if resp.status_code == 401:
+                raise UpstoxTokenError("Upstox token expired (401)")
+            if not resp.is_success:
+                logger.error(f"Upstox retrieve-all error {resp.status_code}: {resp.text[:200]}")
+                return []
+
+            data = resp.json().get("data", [])
+            open_orders = [
+                order for order in data
+                if order.get("status", "").lower() not in ("complete", "rejected", "cancelled")
+            ]
+            return open_orders
+        except Exception as e:
+            logger.error(f"Error fetching open orders from Upstox: {e}")
+            return []
+

@@ -34,10 +34,12 @@ from sqlalchemy import select, or_
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.notifier import notifier
+from app.core.database import async_session_factory
 from app.models.live_trade import LiveTrade
 from app.ingestion.upstox_http import UpstoxHTTPClient
 from app.engine.risk_engine import increment_api_error, reset_api_error
 from app.models.order_event import OrderEvent
+from app.system.trading_state import get_trading_state
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -45,32 +47,48 @@ UPSTOX_ORDER_URL = "https://api.upstox.com/v2/order/place"
 UPSTOX_ORDER_DETAIL_URL = "https://api.upstox.com/v2/order/details"
 
 
-class RateLimiter:
-    """Token bucket for API calls to prevent broker bans."""
+class RedisRateLimiter:
+    """Distributed Token bucket for API calls to prevent broker bans."""
     def __init__(self, calls_per_second: int = 5):
         self.calls_per_second = calls_per_second
-        self._tokens = float(calls_per_second)
-        self._last_update = datetime.now(timezone.utc)
-        self._lock = asyncio.Lock()
+        self.key = "broker_rate_limit_tokens"
+        self._script = """
+            local key = KEYS[1]
+            local rate = tonumber(ARGV[1])
+            local now = tonumber(ARGV[2])
+            
+            local data = redis.call('HMGET', key, 'tokens', 'last_update')
+            local tokens = tonumber(data[1]) or rate
+            local last_update = tonumber(data[2]) or now
+            
+            local elapsed = (now - last_update) / 1000.0
+            tokens = math.min(rate, tokens + elapsed * rate)
+            
+            if tokens >= 1 then
+                tokens = tokens - 1
+                redis.call('HMSET', key, 'tokens', tokens, 'last_update', now)
+                redis.call('PEXPIRE', key, 1000)
+                return 1
+            else
+                redis.call('HMSET', key, 'tokens', tokens, 'last_update', now)
+                redis.call('PEXPIRE', key, 1000)
+                return 0
+            end
+        """
 
     async def acquire(self):
-        async with self._lock:
-            while True:
-                now = datetime.now(timezone.utc)
-                elapsed = (now - self._last_update).total_seconds()
-                self._tokens = min(
-                    self.calls_per_second,
-                    self._tokens + elapsed * self.calls_per_second
-                )
-                self._last_update = now
-                if self._tokens >= 1:
-                    self._tokens -= 1
-                    return
-                await asyncio.sleep(0.1)
+        from app.core.redis import redis_client
+        import time
+        while True:
+            now_ms = int(time.time() * 1000)
+            res = await redis_client.eval(self._script, 1, self.key, self.calls_per_second, now_ms)
+            if res == 1:
+                return
+            await asyncio.sleep(0.1)
 
 
 class ExecutionManager:
-    _rate_limiter = RateLimiter(calls_per_second=5)
+    _rate_limiter = RedisRateLimiter(calls_per_second=5)
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -114,14 +132,16 @@ class ExecutionManager:
         stop_loss: float,
         target_price: float,
         max_slippage_pct: float = 0.001,
+        strategy_id: Optional[int] = None,
     ) -> Optional[LiveTrade]:
         """
         Place a LIMIT order through Upstox API with slippage protection.
 
         Fix: This previously generated a mock order ID. It now calls the real
         Upstox /v2/order/place endpoint with a LIMIT order type.
-        Returns a LiveTrade in PENDING state, or None if the API call failed.
+        Returns a LiveTrade in PENDING or UNKNOWN state, or None if the API call failed.
         """
+        signal_id = kwargs.get("signal_id", "")
         if quantity <= 0:
             logger.error(f"ExecutionManager: {symbol} Invalid quantity {quantity}")
             return None
@@ -129,7 +149,31 @@ class ExecutionManager:
         # Fix Group 8: Execution Drift Protection
         from app.ingestion.websocket_manager import market_data_cache
         current_price = market_data_cache.get_ltp_if_fresh(instrument_key)
-        if current_price is not None and signal_price > 0:
+        # Fix Group 6 (V-07): Reject order if no fresh market data is available.
+        # Previously this block only rejected when drift > max_slippage_pct.
+        # If current_price is None (WebSocket dead, cache expired), we have no
+        # idea what the market price is — proceeding would place an order at a
+        # potentially catastrophically stale signal_price.
+        if current_price is None:
+            logger.error(
+                f"ExecutionManager: No fresh LTP for {symbol} — order REJECTED "
+                f"(instrument_key={instrument_key}). Cannot place order without confirmed market price."
+            )
+            return None
+
+        # ── Global Kill Switch Check ──
+        from app.core.redis import redis_client
+        state = await get_trading_state(redis_client)
+        if state != "ENABLED":
+            logger.error(
+                f"ExecutionManager: Order rejected for {symbol} "
+                f"— Trading disabled by global kill switch (Status: {state})"
+            )
+            from app.alerts.telegram_notifier import send_telegram_alert
+            send_telegram_alert(f"Kill Switch Active: Blocked {direction} order for {symbol}")
+            raise RuntimeError(f"Trading disabled by global kill switch: {state}")
+
+        if signal_price > 0:
             drift = abs(current_price - signal_price) / signal_price
             if drift > max_slippage_pct:
                 logger.warning(
@@ -158,6 +202,8 @@ class ExecutionManager:
             entry_price=signal_price,       # signal price (pre-fill)
             stop_loss=stop_loss,
             target_price=target_price,
+            strategy_id=strategy_id,
+
             risk_amount=risk_amount,
             broker_order_id=temp_order_id,
             filled_quantity=0,
@@ -172,14 +218,31 @@ class ExecutionManager:
         order_status: str = "PENDING"
 
         try:
+            from app.core.redis import redis_client
+            from app.core.circuit_breaker import CircuitBreaker, CircuitState
+            cb = CircuitBreaker(redis=redis_client)
+            
+            if await cb.get_state() == CircuitState.OPEN:
+                logger.error(f"ExecutionManager: Broker API Circuit Breaker is OPEN. Rejecting trade for {symbol}.")
+                from app.core.metrics import TRADE_FAILURES
+                TRADE_FAILURES.labels(symbol=symbol, reason="circuit_breaker_open").inc()
+                from app.alerts.telegram_notifier import send_telegram_alert
+                send_telegram_alert(f"⚠️ Circuit Breaker OPEN: Trade rejected for {symbol}")
+                return None
+
             if self._token:
                 # ── Real Upstox LIMIT order ───────────────────────────
+                # Fix 2: Add Client Order ID Idempotency
+                client_order_id = f"qdss-{signal_id}" if signal_id else f"qdss-{trade.id}"
+                # Limit tag length just in case Upstox has restrictions on tag length
+                client_order_id = client_order_id[:20]
+                
                 payload = {
                     "quantity": quantity,
                     "product": "I",                         # Intraday — MIS
                     "validity": "DAY",
                     "price": limit_price,
-                    "tag": "quantdss",
+                    "tag": client_order_id,
                     "instrument_token": instrument_key,
                     "order_type": "LIMIT",
                     "transaction_type": direction,          # BUY / SELL
@@ -188,13 +251,16 @@ class ExecutionManager:
                     "is_amo": False,
                 }
                 async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.post(
-                        UPSTOX_ORDER_URL,
-                        headers=self._headers(),
-                        json=payload,
-                    )
+                    from app.core.metrics import BROKER_API_LATENCY
+                    with BROKER_API_LATENCY.labels(endpoint="/v2/order/place", method="POST").time():
+                        resp = await client.post(
+                            UPSTOX_ORDER_URL,
+                            headers=self._headers(),
+                            json=payload,
+                        )
 
                 if resp.status_code == 200:
+                    await cb.record_success()
                     data = resp.json().get("data", {})
                     broker_order_id = data.get("order_id", "")
                     order_status = "PENDING"
@@ -207,13 +273,23 @@ class ExecutionManager:
                         f"ExecutionManager: LIVE ORDER PLACED — {direction} {quantity} "
                         f"{symbol} @ Limit ₹{limit_price} | Order ID: {broker_order_id}"
                     )
+
+                    # Fix Group 3 (V-04) & Audit Fix 1: Provisional Stop Loss REMOVED
+                    # We no longer place SL immediately to prevent naked reverse positions
+                    # on partial fills. Webhook will handle SL/TP upon confirmed fill.
+
                     reset_api_error()
                 else:
+                    if resp.status_code >= 500 or resp.status_code == 429:
+                        await cb.record_failure()
+                    
                     error_msg = resp.text[:300]
                     logger.error(
                         f"ExecutionManager: Upstox order rejected "
                         f"(HTTP {resp.status_code}): {error_msg}"
                     )
+                    from app.alerts.telegram_notifier import send_telegram_alert
+                    send_telegram_alert(f"Broker API Failure: {symbol} order rejected (HTTP {resp.status_code})")
                     # Mark trade failed
                     trade.status = "REJECTED"
                     trade.close_reason = "API_ERROR"
@@ -235,7 +311,27 @@ class ExecutionManager:
                 reset_api_error()
 
         except Exception as e:
-            logger.exception(f"ExecutionManager API Error placing order for {symbol}")
+            import httpx
+            if isinstance(e, (httpx.RequestError,)):
+                await cb.record_failure()
+                
+                # Fix 3: Handle HTTP Timeout Safely
+                if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout)):
+                    logger.warning(
+                        f"ExecutionManager: HTTP Timeout occurred placing order for {symbol}. "
+                        "Marking trade as UNKNOWN for broker reconciliation."
+                    )
+                    trade.status = "UNKNOWN"
+                    trade.close_reason = "HTTP_TIMEOUT"
+                    await self.db.flush()
+                    
+                    # Fix 3: Trigger broker reconciliation explicitly over the UNKNOWN trades asynchronously
+                    asyncio.create_task(self.reconcile_orders())
+                    return trade
+                
+            logger.exception(f"ExecutionManager API Error placing order for {symbol}: {e}")
+            from app.alerts.telegram_notifier import send_telegram_alert
+            send_telegram_alert(f"Broker API Error: Exception placing order for {symbol}")
             trade.status = "ERROR"
             trade.close_reason = "EXCEPTION"
             await self.db.flush()
@@ -268,51 +364,77 @@ class ExecutionManager:
             },
         )
 
-        # Fix Group 4: Place protection orders immediately
-        asyncio.create_task(self._place_protection_orders_with_retry(trade.id, stop_loss, target_price))
-
+        # Fix: Protection orders removed here. They will be strictly placed in the webhook handler 
+        # upon confirmed 'complete' fill.
+        
         return trade
 
     async def _place_protection_orders_with_retry(self, trade_id: int, stop_loss: float, target_price: float):
-        """Fix Group 4: Attempt SL/TP placement after entry with exponential backoff."""
-        await asyncio.sleep(1) # Give Upstox time to register the entry
+        """
+        Fix Group 4 (V-05): Protection order retry using an ISOLATED DB SESSION.
+
+        The original implementation used self.db, which is the parent caller's
+        session. When this task runs asynchronously after the parent session has
+        been committed (and the session context has exited), self.db is expired
+        and all attribute access raises DetachedInstanceError, silently preventing
+        SL placement and leaving the position naked.
+
+        Fix: open a fresh session here. Never use self.db inside a background task.
+        """
+        await asyncio.sleep(1)  # Give Upstox a moment to register the entry
         for attempt in range(1, 4):
             try:
-                # Refresh trade from DB
-                trade = await self.db.get(LiveTrade, trade_id)
-                if not trade or trade.status in ("CLOSED", "REJECTED", "CANCELLED"):
-                    return
-                # SL
-                if not trade.sl_order_id:
-                    sl_id = await self.place_sl_order(trade, stop_loss)
-                    if sl_id:
-                        trade.sl_order_id = sl_id
-                        logger.info(f"ExecutionManager: Immediate SL placed for {trade.symbol}: {sl_id}")
-                # TP
-                if not trade.target_order_id:
-                    tp_id = await self.place_target_order(trade, target_price)
-                    if tp_id:
-                        trade.target_order_id = tp_id
-                        logger.info(f"ExecutionManager: Immediate Target placed for {trade.symbol}: {tp_id}")
-                
-                if trade.sl_order_id and trade.target_order_id:
-                    await self.db.commit()
-                    return # Success
-                await self.db.commit()
+                # ── Own fresh session per attempt ────────────────────────────
+                async with async_session_factory() as db:
+                    trade = await db.get(LiveTrade, trade_id)
+                    if not trade or trade.status in ("CLOSED", "REJECTED", "CANCELLED"):
+                        return
+                    # SL
+                    if not trade.sl_order_id:
+                        # Construct a temporary ExecutionManager backed by the fresh session
+                        retry_mgr = ExecutionManager(db)
+                        sl_id = await retry_mgr.place_sl_order(trade, stop_loss)
+                        if sl_id:
+                            trade.sl_order_id = sl_id
+                            logger.info(f"ExecutionManager: Retry SL placed for {trade.symbol}: {sl_id}")
+                    # TP
+                    if not trade.target_order_id:
+                        retry_mgr = ExecutionManager(db)
+                        tp_id = await retry_mgr.place_target_order(trade, target_price)
+                        if tp_id:
+                            trade.target_order_id = tp_id
+                            logger.info(f"ExecutionManager: Retry Target placed for {trade.symbol}: {tp_id}")
+
+                    await db.commit()
+
+                    if trade.sl_order_id and trade.target_order_id:
+                        return  # Both protection orders successfully placed
+
             except Exception as e:
-                logger.error(f"ExecutionManager: Protection order error for trade {trade_id}: {e}")
-            
-            # Backoff before retry
+                logger.error(f"ExecutionManager: Protection order retry {attempt}/3 error for trade {trade_id}: {e}")
+
             if attempt < 3:
                 await asyncio.sleep(2 ** attempt)
 
-        # After all retries failed:
-        trade = await self.db.get(LiveTrade, trade_id)
-        if trade and trade.status not in ("CLOSED", "REJECTED", "CANCELLED"):
-            if not trade.sl_order_id:
-                trade.sl_order_id = None
-                logger.error(f"CRITICAL: SL order placement failed, enabling local protection for trade {trade.id}")
-            await self.db.commit()
+        # After all retries failed — log critical but avoid infinite loop
+        try:
+            async with async_session_factory() as db:
+                trade = await db.get(LiveTrade, trade_id)
+                if trade and trade.status not in ("CLOSED", "REJECTED", "CANCELLED") and not trade.sl_order_id:
+                    logger.error(
+                        f"CRITICAL: SL placement failed after 3 attempts for trade {trade_id} "
+                        f"({trade.symbol}). Position is unprotected. Manual intervention required."
+                    )
+                    asyncio.create_task(notifier.send_alert(
+                        title="CRITICAL: Naked Position",
+                        message=(
+                            f"Trade {trade_id} ({trade.symbol}) has no SL after 3 retry attempts.\n"
+                            f"Manual broker intervention required immediately."
+                        ),
+                        level="CRITICAL",
+                    ))
+        except Exception:
+            pass
 
     async def _retry_api_call(
         self,
@@ -377,18 +499,34 @@ class ExecutionManager:
             "is_amo": False,
         }
         try:
+            from app.core.redis import redis_client
+            from app.core.circuit_breaker import CircuitBreaker
+            cb = CircuitBreaker(redis=redis_client)
+            
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    UPSTOX_ORDER_URL, headers=self._headers(), json=payload
-                )
+                from app.core.metrics import BROKER_API_LATENCY
+                with BROKER_API_LATENCY.labels(endpoint="/v2/order/place", method="POST").time():
+                    resp = await client.post(
+                        UPSTOX_ORDER_URL, headers=self._headers(), json=payload
+                    )
             if resp.status_code == 200:
+                await cb.record_success()
                 order_id = resp.json().get("data", {}).get("order_id", "")
                 return order_id or None
+                
+            if resp.status_code >= 500 or resp.status_code == 429:
+                await cb.record_failure()
+                
             logger.error(
                 f"ExecutionManager SL order rejected (HTTP {resp.status_code}): {resp.text[:200]}"
             )
             return None
         except Exception:
+            import httpx
+            from app.core.redis import redis_client
+            from app.core.circuit_breaker import CircuitBreaker
+            cb = CircuitBreaker(redis=redis_client)
+            await cb.record_failure()
             logger.exception(
                 f"ExecutionManager: Exception placing SL-M order for trade {trade.id}"
             )
@@ -425,18 +563,32 @@ class ExecutionManager:
             "is_amo": False,
         }
         try:
+            from app.core.redis import redis_client
+            from app.core.circuit_breaker import CircuitBreaker
+            cb = CircuitBreaker(redis=redis_client)
+            
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(
                     UPSTOX_ORDER_URL, headers=self._headers(), json=payload
                 )
             if resp.status_code == 200:
+                await cb.record_success()
                 order_id = resp.json().get("data", {}).get("order_id", "")
                 return order_id or None
+                
+            if resp.status_code >= 500 or resp.status_code == 429:
+                await cb.record_failure()
+                
             logger.warning(
                 f"ExecutionManager Target order rejected (HTTP {resp.status_code}): {resp.text[:200]}"
             )
             return None
         except Exception:
+            import httpx
+            from app.core.redis import redis_client
+            from app.core.circuit_breaker import CircuitBreaker
+            cb = CircuitBreaker(redis=redis_client)
+            await cb.record_failure()
             logger.exception(
                 f"ExecutionManager: Exception placing target order for trade {trade.id}"
             )
@@ -461,11 +613,12 @@ class ExecutionManager:
 
         if self._token:
             # Fix 17: Cancel existing SL and Target orders before placing market close
+            from app.engine.order_cancel_queue import enqueue_cancel
             if trade.sl_order_id:
-                await self.cancel_order(trade.sl_order_id)
+                asyncio.create_task(enqueue_cancel(trade.sl_order_id))
                 trade.sl_order_id = None
             if trade.target_order_id:
-                await self.cancel_order(trade.target_order_id)
+                asyncio.create_task(enqueue_cancel(trade.target_order_id))
                 trade.target_order_id = None
 
             payload = {
@@ -492,6 +645,11 @@ class ExecutionManager:
                         f"ExecutionManager flatten: Market close rejected "
                         f"(HTTP {resp.status_code}) for trade {trade.id}: {resp.text[:200]}"
                     )
+                else:
+                    order_id = resp.json().get("data", {}).get("order_id", "")
+                    if order_id:
+                        # Store the closing market order ID so the webhook can match and close the trade
+                        trade.target_order_id = order_id
                 return success
             except Exception:
                 logger.exception(
@@ -526,6 +684,42 @@ class ExecutionManager:
             return success
         except Exception:
             logger.exception(f"ExecutionManager: cancel_order error for {broker_order_id}")
+            return False
+
+    async def modify_order(
+        self,
+        order_id: str,
+        new_trigger_price: float,
+        quantity: int = 0,
+        order_type: str = "SL-M"
+    ) -> bool:
+        """Modify an existing open order (e.g. trailed stop loss) without cancelling it."""
+        try:
+            if self._token:
+                payload = {
+                    "order_id": order_id,
+                    "order_type": order_type,
+                    "validity": "DAY",
+                    "price": 0,
+                    "trigger_price": round(new_trigger_price, 2)
+                }
+                if quantity > 0:
+                    payload["quantity"] = quantity
+
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.put(
+                        "https://api.upstox.com/v2/order/modify",
+                        headers=self._headers(),
+                        json=payload,
+                    )
+                success = resp.status_code == 200
+                if not success:
+                    logger.error(f"ExecutionManager: Order modify rejected (HTTP {resp.status_code}): {resp.text[:200]}")
+                return success
+            else:
+                return True # simulation
+        except Exception:
+            logger.exception(f"ExecutionManager: modify_order error for {order_id}")
             return False
 
     async def handle_webhook(
@@ -576,6 +770,10 @@ class ExecutionManager:
             logger.warning(f"ExecutionManager Webhook: No trade found for order {broker_order_id}")
             return
 
+        local_logger = logger.bind(symbol=trade.symbol, trade_id=trade.id, order_id=broker_order_id)
+        
+        is_entry = (broker_order_id == trade.broker_order_id)
+
         is_sl = trade.sl_order_id == broker_order_id
         is_tp = trade.target_order_id == broker_order_id
 
@@ -585,43 +783,136 @@ class ExecutionManager:
             trade.average_price = avg_price
         
         if status == "complete":
-            if is_sl:
+            if is_sl or is_tp:
                 trade.status = "CLOSED"
                 trade.exit_price = avg_price
-                trade.close_reason = "STOP_LOSS"
+                trade.close_reason = "STOP_LOSS" if is_sl else "TARGET"
                 trade.closed_at = datetime.now(IST)
-                logger.info(f"ExecutionManager Webhook: SL FILLED for {trade.symbol}")
-                # Release risk reservation? Risk group fixes will handle this based on status.
-                await self.db.commit()
-                return
-            elif is_tp:
-                trade.status = "CLOSED"
-                trade.exit_price = avg_price
-                trade.close_reason = "TARGET"
-                trade.closed_at = datetime.now(IST)
-                logger.info(f"ExecutionManager Webhook: TARGET FILLED for {trade.symbol}")
+                
+                pnl = 0.0
+                if getattr(trade, "entry_price", None) and trade.exit_price:
+                    pnl = (trade.exit_price - trade.entry_price) * trade.filled_quantity
+                    if trade.direction == "SELL":
+                        pnl = -pnl
+                    # Fix Group 7: Net PnL
+                    cost = 40.0 + (trade.entry_price * trade.filled_quantity * 0.0005)
+                    pnl -= cost
+                trade.realised_pnl = pnl
+
+                # Update DailyRiskState
+                from datetime import date
+                from app.models.daily_risk_state import DailyRiskState
+                today = date.today()
+                result_state = await self.db.execute(select(DailyRiskState).where(DailyRiskState.trade_date == today))
+                state = result_state.scalar_one_or_none()
+                if state:
+                    current_pnl = float(state.realised_pnl or 0.0)
+                    state.realised_pnl = round(current_pnl + pnl, 2)
+
+                logger.info(f"ExecutionManager Webhook: {trade.close_reason} FILLED for {trade.symbol} (PnL: ₹{pnl:.2f})")
+                
+                # Fix Group 6: Strategy Health Recording
+                if trade.strategy_id:
+                    from app.engine.strategy_health import strategy_health_monitor
+                    asyncio.create_task(strategy_health_monitor.record_trade_async(
+                        trade.strategy_id, pnl, float(trade.risk_amount or 0.0)
+                    ))
+
+                if self._token:
+                    opposite_leg = trade.target_order_id if is_sl else trade.sl_order_id
+                    if opposite_leg:
+                        from app.engine.order_cancel_queue import enqueue_cancel
+                        asyncio.create_task(enqueue_cancel(opposite_leg))
+                        local_logger.info(f"ExecutionManager Webhook: OCO queued cancel for {opposite_leg}")
                 await self.db.commit()
                 return
 
-            # Fix 3: Webhook deduplication. Ignore if already OPEN.
-            if trade.status == "OPEN" and trade.sl_order_id:
+            if trade.status == "OPEN" and trade.sl_order_id and trade.quantity == filled_qty:
                 logger.debug(f"ExecutionManager Webhook: Order {broker_order_id} already processed. Ignoring.")
                 return
 
             trade.status = "OPEN"
             if avg_price > 0 and trade.entry_price > 0:
                 slippage_pct = abs(avg_price - trade.entry_price) / trade.entry_price * 100
-                logger.info(
+                local_logger.info(
                     f"ExecutionManager: Fill slippage for {trade.symbol}: "
                     f"signal=₹{trade.entry_price:.2f} avg_fill=₹{avg_price:.2f} "
                     f"slippage={slippage_pct:.3f}%"
                 )
-            trade.entry_price = avg_price   # update to actual fill price
+            trade.entry_price = avg_price
+            trade.quantity = filled_qty
 
-            # The SL/TP orders are now placed immediately in place_order (Fix Group 4).
-            # We just leave this for edge case recovery or rely solely on place_order.
-            if self._token and not trade.sl_order_id:
-                asyncio.create_task(self._place_protection_orders_with_retry(trade.id, trade.stop_loss, trade.target_price))
+            if self._token:
+                old_sl = trade.sl_order_id
+                old_tgt = trade.target_order_id
+                
+                # Atomically clear order IDs to prevent partial failure resulting in naked trades
+                trade.sl_order_id = None
+                trade.target_order_id = None
+                await self.db.commit()
+
+                from app.engine.order_cancel_queue import enqueue_cancel
+                if old_sl:
+                    asyncio.create_task(enqueue_cancel(old_sl))
+                if old_tgt:
+                    asyncio.create_task(enqueue_cancel(old_tgt))
+
+                # Fix 1: Place SL and TP only now that the entry order is COMPLETE.
+                new_sl = await self.place_sl_order(trade, trade.stop_loss)
+                new_tgt = await self.place_target_order(trade, trade.target_price)
+                
+                trade.sl_order_id = new_sl
+                trade.target_order_id = new_tgt
+                await self.db.commit()
+
+                if not trade.sl_order_id or not trade.target_order_id:
+                    asyncio.create_task(self._place_protection_orders_with_retry(trade.id, trade.stop_loss, trade.target_price))
+
+        elif status == "open" and filled_qty > 0:
+            # ── Active Partial Fill ────────────────────────────────────────────────────
+            original_qty = trade.quantity
+            trade.status = "OPEN"
+            trade.quantity = filled_qty
+            trade.filled_quantity = filled_qty
+            if avg_price > 0:
+                trade.entry_price = avg_price
+            
+            stop_distance = abs((trade.entry_price or 0) - (trade.stop_loss or 0))
+            if stop_distance > 0:
+                trade.risk_amount = round(filled_qty * stop_distance, 2)
+            
+            local_logger.warning(
+                f"ExecutionManager Webhook: Partial fill for {trade.symbol} "
+                f"({filled_qty}/{original_qty} shares). Risk reduced to ₹{trade.risk_amount or 0:.2f}"
+            )
+            
+            if self._token:
+                old_sl = trade.sl_order_id
+                old_tgt = trade.target_order_id
+                
+                trade.sl_order_id = None
+                trade.target_order_id = None
+                await self.db.commit()
+
+                from app.engine.order_cancel_queue import enqueue_cancel
+                if old_sl:
+                    asyncio.create_task(enqueue_cancel(old_sl))
+                if old_tgt:
+                    asyncio.create_task(enqueue_cancel(old_tgt))
+
+                new_sl = await self.place_sl_order(trade, trade.stop_loss)
+                new_tgt = await self.place_target_order(trade, trade.target_price)
+                
+                trade.sl_order_id = new_sl
+                trade.target_order_id = new_tgt
+                await self.db.commit()
+
+            asyncio.create_task(notifier.send_alert(
+                title="Active Partial Fill",
+                message=(f"{trade.symbol}: {filled_qty} shares filled so far. "
+                         f"Target/SL updated to qty={filled_qty}."),
+                level="WARNING",
+            ))
 
         elif status in ("rejected", "cancelled"):
             if is_sl or is_tp:
@@ -630,56 +921,43 @@ class ExecutionManager:
                 logger.warning(f"ExecutionManager Webhook: {'SL' if is_sl else 'TP'} CANCELLED/REJECTED for {trade.symbol}")
                 await self.db.commit()
                 return
+
             if filled_qty > 0:
-                # ── Partial fill ────────────────────────────────────────────────────
-                # Only quantity shrinks; SL/TP *prices* remain unchanged.
-                # risk_amount is recalculated so portfolio exposure is correct.
-                original_qty = trade.quantity
                 trade.status = "OPEN"
                 trade.quantity = filled_qty
-                trade.filled_quantity = filled_qty
-                stop_distance = abs(
-                    (trade.entry_price or 0) - (trade.stop_loss or 0)
-                )
-                if stop_distance > 0:
-                    trade.risk_amount = round(filled_qty * stop_distance, 2)
-                logger.warning(
-                    f"ExecutionManager Webhook: Partial fill for {trade.symbol} "
-                    f"({filled_qty}/{original_qty} shares). "
-                    f"Risk reduced to ₹{trade.risk_amount or 0:.2f}"
-                )
-                # Fix 7: Cancel old full-qty target, place new reduced-qty one.
-                # Without this, the stale target at full=original_qty would overshoot
-                # the actual position, creating a naked SELL on the excess quantity.
-                if self._token and trade.target_order_id:
-                    cancelled = await self.cancel_order(trade.target_order_id)
-                    if cancelled:
-                        logger.info(
-                            f"ExecutionManager Webhook (Partial): Cancelled stale target "
-                            f"{trade.target_order_id} for {trade.symbol}"
-                        )
+
+                if self._token:
+                    old_sl = trade.sl_order_id
+                    old_tgt = trade.target_order_id
+                    
+                    trade.sl_order_id = None
+                    trade.target_order_id = None
+                    await self.db.commit()
+
+                    from app.engine.order_cancel_queue import enqueue_cancel
+                    if old_sl:
+                        asyncio.create_task(enqueue_cancel(old_sl))
+                    if old_tgt:
+                        asyncio.create_task(enqueue_cancel(old_tgt))
+
+                    new_sl = await self.place_sl_order(trade, trade.stop_loss)
                     new_tgt = await self.place_target_order(trade, trade.target_price)
-                    if new_tgt:
-                        trade.target_order_id = new_tgt
-                        logger.info(
-                            f"ExecutionManager Webhook (Partial): New target {new_tgt} "
-                            f"for {trade.symbol} qty={filled_qty}"
-                        )
-                asyncio.create_task(notifier.send_alert(
-                    title="Partial Fill",
-                    message=(
-                        f"{trade.symbol}: {filled_qty}/{original_qty} filled. "
-                        f"Risk ₹{trade.risk_amount or 0:.2f}. "
-                        f"Target updated to qty={filled_qty}."
-                    ),
-                    level="WARNING",
-                ))
+                    
+                    trade.sl_order_id = new_sl
+                    trade.target_order_id = new_tgt
+                    await self.db.commit()
+
+                    if not trade.sl_order_id or not trade.target_order_id:
+                        asyncio.create_task(self._place_protection_orders_with_retry(trade.id, trade.stop_loss, trade.target_price))
+
+                logger.warning(
+                    f"ExecutionManager Webhook: Cancelled partial fill protected for {trade.symbol} "
+                    f"({filled_qty} shares)."
+                )
             else:
                 trade.status = "CLOSED"
                 trade.close_reason = status.upper()
                 trade.closed_at = datetime.now(IST)
-                # Fix 4: Removed increment_api_error(). A broker rejection is NOT
-                # an API connectivity failure and must not fire the circuit breaker.
 
 
         await self.db.commit()
@@ -696,7 +974,7 @@ class ExecutionManager:
         """
         result = await self.db.execute(
             select(LiveTrade).where(
-                LiveTrade.status.in_(["PENDING", "PARTIALLY_FILLED"])
+                LiveTrade.status.in_(["PENDING", "PARTIALLY_FILLED", "OPEN", "UNKNOWN"])
             )
         )
         pending_trades = result.scalars().all()
@@ -704,7 +982,7 @@ class ExecutionManager:
         if not pending_trades:
             return
 
-        logger.info(f"ExecutionManager: Reconciling {len(pending_trades)} pending orders")
+        logger.info(f"ExecutionManager: Reconciling {len(pending_trades)} live orders")
 
         for trade in pending_trades:
             # Skip very recent orders — they may still be processing
@@ -714,46 +992,135 @@ class ExecutionManager:
                     continue
 
             try:
-                if not self._token or not trade.broker_order_id:
+                if not self._token:
                     continue
 
-                async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get(
-                        UPSTOX_ORDER_DETAIL_URL,
-                        headers=self._headers(),
-                        params={"order_id": trade.broker_order_id},
-                    )
+                orders_to_check = []
+                if trade.status == "OPEN":
+                    if trade.sl_order_id: orders_to_check.append(("SL", trade.sl_order_id))
+                    if trade.target_order_id: orders_to_check.append(("TP", trade.target_order_id))
+                elif trade.broker_order_id:
+                    # Fix 7: If PENDING/UNKNOWN and no precise broker_order_id or it's just 'pending_...',
+                    # try to fetch the order by its client_order_id `tag`
+                    if trade.status in ["PENDING", "UNKNOWN"] and "pending_" in trade.broker_order_id:
+                        orders_to_check.append(("ENTRY", f"qdss-{trade.id}"))
+                    else:
+                        orders_to_check.append(("ENTRY", trade.broker_order_id))
 
-                if not resp.is_success:
-                    logger.warning(
-                        f"ExecutionManager Reconcile: Could not fetch order "
-                        f"{trade.broker_order_id}: HTTP {resp.status_code}"
-                    )
-                    continue
+                for order_mode, broker_id in orders_to_check:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        resp = await client.get(
+                            UPSTOX_ORDER_DETAIL_URL,
+                            headers=self._headers(),
+                            params={"tag": broker_id} if order_mode == "ENTRY" and broker_id.startswith("qdss-") else {"order_id": broker_id},
+                        )
 
-                data = resp.json().get("data", {})
-                broker_status = data.get("status", "")
-                filled_qty = int(data.get("filled_quantity", 0))
-                avg_price = float(data.get("average_price", 0.0))
+                    if not resp.is_success:
+                        logger.warning(
+                            f"ExecutionManager Reconcile: Could not fetch order "
+                            f"{broker_id}: HTTP {resp.status_code}"
+                        )
+                        continue
 
-                if broker_status == "complete":
-                    trade.status = "OPEN"
-                    trade.filled_quantity = filled_qty
-                    trade.average_price = avg_price
-                    if avg_price > 0:
-                        trade.entry_price = avg_price
-                    logger.info(
-                        f"ExecutionManager Reconcile: "
-                        f"Trade {trade.id} reconciled as OPEN (filled @ ₹{avg_price})"
-                    )
-                elif broker_status in ("rejected", "cancelled") and filled_qty == 0:
-                    trade.status = "CLOSED"
-                    trade.close_reason = broker_status.upper()
-                    trade.closed_at = datetime.now(IST)
-                    logger.info(
-                        f"ExecutionManager Reconcile: "
-                        f"Trade {trade.id} reconciled as CLOSED ({broker_status})"
-                    )
+                    data = resp.json().get("data", [])
+                    if isinstance(data, list) and len(data) > 0:
+                        data = data[0]
+                    elif not isinstance(data, dict):
+                        data = {}
+                        
+                    broker_status = data.get("status", "")
+                    filled_qty = int(data.get("filled_quantity", 0))
+                    avg_price = float(data.get("average_price", 0.0))
+
+                    if order_mode == "ENTRY":
+                        if broker_status == "complete":
+                            trade.status = "OPEN"
+                            trade.filled_quantity = filled_qty
+                            trade.average_price = avg_price
+                            if avg_price > 0:
+                                trade.entry_price = avg_price
+                            logger.info(
+                                f"ExecutionManager Reconcile: "
+                                f"Trade {trade.id} reconciled as OPEN (filled @ ₹{avg_price})"
+                            )
+                        elif broker_status == "open" and filled_qty > 0:
+                            trade.status = "OPEN"
+                            trade.quantity = filled_qty
+                            trade.filled_quantity = filled_qty
+                            if avg_price > 0:
+                                trade.entry_price = avg_price
+                            
+                            stop_distance = abs((trade.entry_price or 0) - (trade.stop_loss or 0))
+                            if stop_distance > 0:
+                                trade.risk_amount = round(filled_qty * stop_distance, 2)
+                                
+                            logger.warning(
+                                f"ExecutionManager Reconcile: Partial fill {trade.id} "
+                                f"reconciled as OPEN ({filled_qty} shares)"
+                            )
+                            # Safe retry placement of SL/TP which might have been skipped
+                            if self._token:
+                                asyncio.create_task(self._place_protection_orders_with_retry(
+                                    trade.id, trade.stop_loss, trade.target_price
+                                ))
+                        elif broker_status in ("rejected", "cancelled") and filled_qty == 0:
+                            trade.status = "CLOSED"
+                            trade.close_reason = broker_status.upper()
+                            trade.closed_at = datetime.now(IST)
+                            logger.info(
+                                f"ExecutionManager Reconcile: "
+                                f"Trade {trade.id} reconciled as CLOSED ({broker_status})"
+                            )
+                            # Fix Group 6: Strategy Health Recording
+                            if trade.strategy_id:
+                                from app.engine.strategy_health import strategy_health_monitor
+                                asyncio.create_task(strategy_health_monitor.record_trade_async(
+                                    trade.strategy_id, 0.0, float(trade.risk_amount or 0.0)
+                                ))
+                    else:
+                        # Reconciling an OPEN position by checking its SL / TP legs
+                        if broker_status == "complete":
+                            trade.status = "CLOSED"
+                            trade.exit_price = avg_price
+                            trade.close_reason = "STOP_LOSS" if order_mode == "SL" else "TARGET"
+                            trade.closed_at = datetime.now(IST)
+                            
+                            pnl = 0.0
+                            if getattr(trade, "entry_price", None) and trade.exit_price:
+                                pnl = (trade.exit_price - trade.entry_price) * trade.filled_quantity
+                                if trade.direction == "SELL":
+                                    pnl = -pnl
+                                # Fix Group 7: Net PnL (Deduct fees & slippage)
+                                cost = 40.0 + (trade.entry_price * trade.filled_quantity * 0.0005)
+                                pnl -= cost
+                            trade.realised_pnl = pnl
+                            
+                            # Update DailyRiskState
+                            from datetime import date
+                            from app.models.daily_risk_state import DailyRiskState
+                            today = date.today()
+                            result_state = await self.db.execute(select(DailyRiskState).where(DailyRiskState.trade_date == today))
+                            state = result_state.scalar_one_or_none()
+                            if state:
+                                current_pnl = float(state.realised_pnl or 0.0)
+                                state.realised_pnl = round(current_pnl + pnl, 2)
+
+                            logger.info(
+                                f"ExecutionManager Reconcile: "
+                                f"Trade {trade.id} OPEN position closed due to {order_mode} fill @ ₹{avg_price} (PnL: ₹{pnl:.2f})"
+                            )
+                            # Fix Group 6: Strategy Health Recording
+                            if trade.strategy_id:
+                                from app.engine.strategy_health import strategy_health_monitor
+                                asyncio.create_task(strategy_health_monitor.record_trade_async(
+                                    trade.strategy_id, pnl, float(trade.risk_amount or 0.0)
+                                ))
+                            # Enforce OCO locally here too if one fired
+                            opposite_leg = trade.target_order_id if order_mode == "SL" else trade.sl_order_id
+                            if opposite_leg:
+                                from app.engine.order_cancel_queue import enqueue_cancel
+                                asyncio.create_task(enqueue_cancel(opposite_leg))
+                            break # No need to check the other leg if this one already closed it
 
                 reset_api_error()
 

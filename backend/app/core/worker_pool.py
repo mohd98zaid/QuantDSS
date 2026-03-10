@@ -11,7 +11,7 @@ Issue 8b Fix:
   so that the calculation runs in a separate OS process and the event loop
   remains free to handle incoming ticks.
 
-Usage in signal_pipeline.py:
+Usage in workers:
     from app.core.worker_pool import get_worker_pool
     import asyncio
 

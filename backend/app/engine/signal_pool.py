@@ -70,7 +70,13 @@ class CandidateSignalPool:
     async def _recover_from_redis(self):
         """Recover pending signals from Redis after a restart."""
         try:
-            keys = await redis_client.keys(f"{self._redis_key_prefix}*")
+            cursor = 0
+            keys = []
+            while True:
+                cursor, batch = await redis_client.scan(cursor=cursor, match=f"{self._redis_key_prefix}*", count=100)
+                keys.extend(batch)
+                if cursor == 0 or cursor == b'0':
+                    break
             if not keys:
                 return
 
@@ -150,6 +156,7 @@ class CandidateSignalPool:
         async with self._lock:
             for symbol_id, first_time in list(self._first_signal_time.items()):
                 age = (now - first_time).total_seconds()
+                logger.debug(f"Signal pool check: symbol_id={symbol_id}, age={age:.2f}s, window={self.window_seconds}s")
                 
                 # If the signal group has lived in the pool for >= window_seconds, flush it
                 if age >= self.window_seconds:

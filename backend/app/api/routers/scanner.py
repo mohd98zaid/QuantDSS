@@ -428,27 +428,6 @@ async def list_scanner_strategies(_user: dict = Depends(get_current_user)):
     ]
 
 
-@router.get("/scanner/search")
-async def search_symbols(
-    q: str = Query(..., min_length=1, description="Symbol or company name to search"),
-    limit: int = Query(15, ge=1, le=50),
-    _user: dict = Depends(get_current_user),
-):
-    """
-    Autocomplete symbol search using Upstox NSE instruments master.
-
-    Returns list of {symbol, name, key, exchange, lot_size}.
-    The instruments list is downloaded once and cached for 24 hours.
-    """
-    results = await instruments_lookup.search(q, limit=limit)
-    return {
-        "query": q,
-        "results": results,
-        "instruments_loaded": instruments_lookup.symbol_count,
-        "source": "upstox_instruments_master",
-    }
-
-
 @router.post("/scanner/analyze", response_model=ScanResponse)
 async def scan_symbol(
     req: ScanRequest,
@@ -523,94 +502,68 @@ async def scan_symbol(
     )
 
 
-async def _save_signals_to_db(results: list, strategy: str, timeframe: str) -> None:
-    """Persist BUY/SELL scanner results to the `signals` table."""
+async def _auto_trade_hook(results: list, strategy: str, timeframe: str) -> None:
+    """
+    Feeds scanner signals into the Intelligence Pipeline (Fix C-06).
+    The intelligence pipeline handles: consolidation → confirmation →
+    quality scoring → ML → NLP → time filter → final alert → AutoTrader.
+    """
+    from datetime import datetime, timezone
     from app.core.database import async_session_factory
-    from app.models.signal import Signal
     from app.models.symbol import Symbol
     from sqlalchemy import select
 
+    logger.info(f"--- AUTO TRADE HOOK CALLED ---\nStrategy: {strategy}\nTimeframe: {timeframe}\nResults: {results}")
+
+    if not results:
+        return
+
+    # Build symbol lookup map from DB and auto-create missing symbols
+    sym_map = {}
     try:
         async with async_session_factory() as db:
-            # Build a symbol lookup map once
-            sym_names = [r.symbol for r in results]
+            sym_names = list(set([r.symbol for r in results]))
             sym_result = await db.execute(
                 select(Symbol).where(Symbol.trading_symbol.in_(sym_names))
             )
             sym_map = {s.trading_symbol: s.id for s in sym_result.scalars().all()}
-
-            for r in results:
-                db.add(Signal(
-                    symbol_id=sym_map.get(r.symbol),      # None if not in watchlist — OK
-                    signal_type=r.signal,
-                    entry_price=r.entry_price or 0,
-                    stop_loss=r.stop_loss or 0,
-                    target_price=r.target_price or 0,
-                    risk_reward=r.risk_reward or 0,
-                    risk_status="APPROVED",
-                    block_reason=None,
-                ))
-            await db.commit()
+            
+            # Auto-create missing symbols
+            missing = [name for name in sym_names if name not in sym_map]
+            if missing:
+                for name in missing:
+                    db.add(Symbol(trading_symbol=name, exchange="NSE", is_active=True))
+                await db.commit()
+                
+                # Fetch again to get the newly generated IDs
+                sym_result = await db.execute(
+                    select(Symbol).where(Symbol.trading_symbol.in_(sym_names))
+                )
+                sym_map = {s.trading_symbol: s.id for s in sym_result.scalars().all()}
     except Exception as e:
-        logger.warning(f"_save_signals_to_db failed (non-critical): {e}")
+        logger.warning(f"Symbol map lookup/creation failed: {e}")
 
-
-async def _auto_trade_hook(results: list, strategy: str, timeframe: str) -> None:
-    """
-    Safe wrapper called after a scan:
-    1. Persists signals to the signals DB table → Signals page.
-    2. Publishes to SSE stream → Dashboard Live Signal Feed.
-    3. Feeds signals into the Intelligence Pipeline (Fix C-06).
-       The intelligence pipeline handles: consolidation → confirmation →
-       quality scoring → ML → NLP → time filter → final alert → AutoTrader.
-    4. Falls back to direct AutoTrader if intelligence pipeline is not available.
-    """
-    from datetime import datetime, timezone
-    from app.alerts.sse_manager import SSEManager
-
-    logger.info(f"--- AUTO TRADE HOOK CALLED ---\nStrategy: {strategy}\nTimeframe: {timeframe}\nResults: {results}")
-
-    # ── 1. Save to DB ────────────────────────────────────────────────────
-    await _save_signals_to_db(results, strategy, timeframe)
-
-    # ── 2. Publish to SSE dashboard feed ─────────────────────────────────
-    for r in results:
-        try:
-            await SSEManager.publish_signal_event({
-                "signal_type": r.signal,
-                "symbol": r.symbol,
-                "strategy": strategy,
-                "timeframe": timeframe,
-                "entry_price": float(r.entry_price or 0),
-                "stop_loss": float(r.stop_loss or 0),
-                "target_price": float(r.target_price or 0),
-                "risk_reward": float(r.risk_reward or 0),
-                "rsi": float(r.rsi) if r.rsi is not None else None,
-                "trend": r.trend,
-                "change_pct": float(r.change_pct or 0),
-                "risk_status": "APPROVED",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-        except Exception as e:
-            logger.debug(f"SSE publish failed for {r.symbol}: {e}")
-
-    # ── 3. Feed into Intelligence Pipeline via SignalPool (Fix C-06) ─────
+    # ── 3. Queue into Intelligence Pipeline via Redis (Fix C-06) ────────
     # Corrective Refactor: ALL scanner signals go through the intelligence
-    # pipeline.  The old direct-to-AutoTrader fallback has been REMOVED.
+    # pipeline. The scanner (running in API container) cannot use memory
+    # structures like SignalPool from the worker containers. Must use Redis.
     try:
-        from app.engine.signal_pool import signal_pool
-        from app.engine.base_strategy import CandidateSignal
+        from app.core.streams import publish_to_stream, STREAM_SIGNALS_CANDIDATE
         from app.engine.signal_dedup import signal_dedup
+        from app.engine.base_strategy import CandidateSignal
         from app.engine.signal_trace import SignalTracer
+        from app.engine.signal_pool import _serialize_signal
 
         trace_id = SignalTracer.new_trace_id()
         fed = 0
         for r in results:
             if r.signal not in ("BUY", "SELL"):
                 continue
-            # Convert BulkScanResult → CandidateSignal for the intelligence pipeline
+            
+            # Convert BulkScanResult → CandidateSignal
             candidate = CandidateSignal(
-                symbol_id=0,  # Scanner doesn't have DB symbol ID
+                symbol_id=sym_map.get(r.symbol) or 0,  # Map DB symbol ID or 0 if missing
+                symbol_name=r.symbol,
                 strategy_id=0,
                 strategy_name=strategy,
                 signal_type=r.signal,
@@ -622,17 +575,29 @@ async def _auto_trade_hook(results: list, strategy: str, timeframe: str) -> None
                 confidence_score=float(r.risk_reward or 0) * 20,  # Approx score
                 metadata={"symbol_name": r.symbol, "source": "scanner", "trace_id": trace_id},
             )
-            # Dedup check (Implicitly records if it wasn't a duplicate)
+            
+            # Dedup check
             if await signal_dedup.is_duplicate(candidate.symbol_id, candidate.strategy_id, candidate.candle_time):
                 SignalTracer.trace_drop(trace_id, "DEDUP_CHECK", r.symbol, "Duplicate from scanner suppressed")
                 continue
-            await signal_pool.add_signal(candidate)
+                
+            # Publish to signals:candidate where signal-engine-worker listens
+            await publish_to_stream(
+                STREAM_SIGNALS_CANDIDATE,
+                {
+                    "symbol_id": candidate.symbol_id,
+                    "symbol_name": r.symbol,
+                    "strategy_name": strategy,
+                    "payload": _serialize_signal(candidate)
+                }
+            )
             fed += 1
+            
         if fed:
-            SignalTracer.trace_pass(trace_id, "SIGNAL_POOL", strategy, f"{fed} scanner signal(s) queued")
-            logger.info(f"C-06: {fed} scanner signal(s) routed to intelligence pipeline (trace={trace_id})")
+            SignalTracer.trace_pass(trace_id, "PUBLISH_REDIS", strategy, f"{fed} scanner signal(s) published to {STREAM_SIGNALS_CANDIDATE}")
+            logger.info(f"C-06: {fed} scanner signal(s) published to redis stream (trace={trace_id})")
     except Exception as e:
-        logger.warning(f"Intelligence pipeline routing failed: {e}")
+        logger.warning(f"Intelligence pipeline queuing via Redis failed: {e}")
 
 
 

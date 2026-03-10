@@ -27,7 +27,7 @@ passlib[bcrypt]>=1.7.4
 bcrypt==4.0.1
 
 # Logging
-loguru>=0.7.0
+structlog>=24.1.0
 
 # Rate Limiting
 slowapi>=0.1.9
@@ -62,9 +62,14 @@ aiokafka>=0.10.0
 # Performance
 polars>=1.0.0
 
-# Monitoring
+# Monitoring & Tracing
 prometheus-fastapi-instrumentator>=7.0.0
 prometheus-client>=0.20.0
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp>=1.20.0
+opentelemetry-instrumentation-fastapi>=0.40b0
+opentelemetry-instrumentation-httpx>=0.40b0
 
 # WebSocket client
 websockets>=12.0

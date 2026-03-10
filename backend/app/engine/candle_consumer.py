@@ -220,7 +220,7 @@ class CandleConsumer:
         SignalTracer.trace(trace_id, "CANDLE_CONSUMER", symbol, f"Evaluating {len(self._runner.loaded_strategies)} strategies")
 
         try:
-            signals = self._runner.evaluate(df, symbol_id)
+            signals = await self._runner.evaluate(df, symbol_id)
 
             if not signals:
                 return

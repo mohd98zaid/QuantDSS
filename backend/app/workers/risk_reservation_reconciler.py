@@ -21,7 +21,13 @@ class RiskReservationReconciler(WorkerBase):
         logger.info(f"[{self.NAME}] Starting periodic reservation reconciliation...")
         while self.is_running:
             try:
-                res_keys = await redis_client.keys("risk_reservation:*")
+                cursor = 0
+                res_keys = []
+                while True:
+                    cursor, batch = await redis_client.scan(cursor=cursor, match="risk_reservation:*", count=100)
+                    res_keys.extend(batch)
+                    if cursor == 0 or cursor == b'0':
+                        break
                 now = datetime.now(timezone.utc)
 
                 expired_count = 0

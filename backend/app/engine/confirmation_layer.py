@@ -43,7 +43,14 @@ class ConfirmationLayer:
         """
         total_weight = 0.0
         
-        for strat_name in signal.contributing_signals.keys():
+        for strat_name, sig in signal.contributing_signals.items():
+            # If any contributing signal came from the manual scanner, bypass weight requirement
+            is_scanner = getattr(sig, "metadata", {}).get("source") == "scanner"
+            if is_scanner:
+                logger.debug(f"Confirmation Layer: Bypassing weight check for scanner-sourced signal on {signal.symbol_id}")
+                total_weight = max(total_weight, self.min_confirmations)
+                break
+
             # Derive score heavily tied to our standard names
             strat_lower = strat_name.lower()
             matched_weight = 1.0

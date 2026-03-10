@@ -37,7 +37,7 @@ class PaperTradeResponse(BaseModel):
     target_price: float
     status: str
     exit_price: float | None
-    realized_pnl: float
+    realized_pnl: float | None
     created_at: datetime
     closed_at: datetime | None
 

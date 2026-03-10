@@ -22,6 +22,7 @@ import pandas as pd
 from app.core.logging import logger
 from app.core.streams import (
     STREAM_CANDLES,
+    STREAM_SIGNALS_CANDIDATE,
     STREAM_SIGNALS_APPROVED,
     consume_stream,
     publish_to_stream,
@@ -74,6 +75,7 @@ class SignalEngineWorker(WorkerBase):
         """
         from app.engine.signal_pool import signal_pool
         from app.engine.consolidation_layer import consolidation_layer
+        from app.engine.meta_strategy_engine import meta_strategy_engine
         from app.engine.confirmation_layer import confirmation_layer
         from app.engine.quality_score_layer import quality_score_layer
         from app.engine.ml_filter_layer import ml_filter_layer
@@ -82,7 +84,8 @@ class SignalEngineWorker(WorkerBase):
 
         # Wire callbacks: each layer calls the next
         signal_pool.set_callback(consolidation_layer.process_signal_group)
-        consolidation_layer.set_callback(confirmation_layer.verify_confirmation)
+        consolidation_layer.set_callback(meta_strategy_engine.filter_signal)
+        meta_strategy_engine.set_callback(confirmation_layer.verify_confirmation)
         confirmation_layer.set_callback(quality_score_layer.score_signal)
         quality_score_layer.set_callback(ml_filter_layer.evaluate)
         ml_filter_layer.set_callback(nlp_filter_layer.evaluate)
@@ -104,11 +107,25 @@ class SignalEngineWorker(WorkerBase):
         Publishes to signals:approved and persists to DB.
         """
         sym_name = getattr(signal, "symbol_name", "UNKNOWN")
+        strat_name = getattr(signal, "primary_strategy", "UNKNOWN")
+        
+        # Structlog context injection
+        import structlog
+        structlog.contextvars.bind_contextvars(
+            symbol=sym_name,
+            strategy=strat_name,
+            signal_id=str(getattr(signal, "signal_id", ""))
+        )
 
         # Build message for Redis stream
         contributing = list(signal.contributing_signals.keys())
         # Use the best entry/SL/target from contributing signals
         primary = list(signal.contributing_signals.values())[0]
+        
+        if not sym_name or sym_name == "UNKNOWN":
+            sym_name = getattr(primary, "metadata", {}).get("symbol_name", str(sym_name))
+            if not sym_name or sym_name == "UNKNOWN":
+                sym_name = getattr(primary, "symbol_name", "UNKNOWN")
 
         message = {
             "symbol_id": str(signal.symbol_id),
@@ -127,20 +144,41 @@ class SignalEngineWorker(WorkerBase):
             # Carry replay context through the pipeline
             "is_replay": str(getattr(signal, "is_replay", False)),
             "replay_session_id": str(getattr(signal, "replay_session_id", "")),
+            # Carry manual override context
+            "is_scanner": str(getattr(primary, "metadata", {}).get("source") == "scanner"),
         }
 
+        # ── Global Kill Switch Check (Soft Block) ──
+        from app.core.redis import redis_client
+        from app.system.trading_state import is_trading_enabled
+        
+        trading_enabled = await is_trading_enabled(redis_client)
+        if not trading_enabled:
+            # Mark signal as blocked, but still save it
+            message["risk_status"] = "blocked_kill_switch"
+            status_for_db = "BLOCKED_KILL_SWITCH"
+            local_logger.warning(
+                f"[{self.NAME}] Signal soft-blocked by global kill switch: "
+                f"{sym_name} {signal.signal_type}"
+            )
+        else:
+            message["risk_status"] = "APPROVED"
+            status_for_db = "APPROVED"
+
         msg_id = await publish_to_stream(STREAM_SIGNALS_APPROVED, message)
+        
+        local_logger = logger.bind(symbol=sym_name, signal_id=msg_id)
 
         if msg_id:
-            logger.info(
+            local_logger.info(
                 f"[{self.NAME}] ✅ Published approved signal: {sym_name} "
-                f"{signal.signal_type} → {STREAM_SIGNALS_APPROVED} (id={msg_id})"
+                f"{signal.signal_type} → {STREAM_SIGNALS_APPROVED}"
             )
 
         # Also persist to DB for UI visibility
         try:
             from app.engine.final_alert_generator import _persist_signal_to_db
-            await _persist_signal_to_db(signal, status="APPROVED")
+            await _persist_signal_to_db(signal, status=status_for_db)
         except Exception as e:
             logger.warning(f"[{self.NAME}] DB persist failed (non-critical): {e}")
 
@@ -154,7 +192,7 @@ class SignalEngineWorker(WorkerBase):
                 "stop_loss": float(primary.stop_loss),
                 "target_price": float(primary.target_price),
                 "quality_score": getattr(signal, "quality_score", None),
-                "risk_status": "APPROVED",
+                "risk_status": status_for_db,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
         except Exception:
@@ -165,6 +203,9 @@ class SignalEngineWorker(WorkerBase):
     async def _handle_candle(self, msg_id: str, data: dict[str, str]):
         """Process a single candle message from the Redis stream."""
         symbol = data.get("symbol", "")
+        # Bind context to local logger
+        local_logger = logger.bind(symbol=symbol, msg_id=msg_id)
+        
         symbol_id = int(data.get("symbol_id", "0"))
         instrument_key = data.get("instrument_key", "")
         is_replay = data.get("is_replay", "0") == "1"
@@ -210,7 +251,7 @@ class SignalEngineWorker(WorkerBase):
 
         # Evaluate strategies
         try:
-            signals = self._strategy_runner.evaluate(df, symbol_id)
+            signals = await self._strategy_runner.evaluate(df, symbol_id)
 
             if signals:
                 for sig in signals:
@@ -223,6 +264,15 @@ class SignalEngineWorker(WorkerBase):
                     sig.is_replay = is_replay
                     sig.replay_session_id = replay_session_id
 
+                    from app.engine.signal_dedup import signal_dedup
+                    if await signal_dedup.is_duplicate(
+                        sig.symbol_id,
+                        sig.strategy_id,
+                        sig.candle_time
+                    ):
+                        logger.debug(f"[{self.NAME}] Duplicate signal skipped: {sig.symbol_name} (strat: {sig.strategy_id})")
+                        continue
+
                     await self._signal_pool.add_signal(sig)
 
                 logger.info(
@@ -231,6 +281,38 @@ class SignalEngineWorker(WorkerBase):
                 )
         except Exception as e:
             logger.exception(f"[{self.NAME}] Strategy evaluation failed for {symbol}: {e}")
+
+    # ── Candidate Signal Message Handler (Scanner signals) ───────────────────
+
+    async def _handle_candidate_signal(self, msg_id: str, data: dict[str, str]):
+        """Process a scanner candidate signal from the Redis stream."""
+        try:
+            symbol = data.get("symbol_name", "")
+            if not symbol or not self._shard.owns(symbol):
+                return
+            
+            payload = data.get("payload")
+            if not payload:
+                return
+                
+            from app.engine.signal_pool import _deserialize_signal
+            sig = _deserialize_signal(payload)
+            
+            # Structlog context injection
+            import structlog
+            structlog.contextvars.bind_contextvars(
+                symbol=symbol,
+                strategy=sig.strategy_name,
+                signal_id=msg_id
+            )
+                
+            from app.engine.signal_pool import _deserialize_signal
+            sig = _deserialize_signal(payload)
+            await self._signal_pool.add_signal(sig)
+            
+            logger.info(f"[{self.NAME}] Ingested {sig.strategy_name} scanner signal for {symbol} into pipeline")
+        except Exception as e:
+            logger.exception(f"[{self.NAME}] Failed to ingest candidate signal: {e}")
 
     # ── Main Loop ────────────────────────────────────────────────────────────
 
@@ -242,12 +324,22 @@ class SignalEngineWorker(WorkerBase):
         # Wait briefly for infrastructure to settle
         await asyncio.sleep(2)
 
-        await consume_stream(
-            stream=STREAM_CANDLES,
-            group=self.CONSUMER_GROUP,
-            consumer=self.CONSUMER_NAME,
-            handler=self._handle_candle,
-            running=lambda: self.is_running,
+        # Run two consumer loops concurrently: one for candles, one for candidate signals
+        await asyncio.gather(
+            consume_stream(
+                stream=STREAM_CANDLES,
+                group=self.CONSUMER_GROUP,
+                consumer=self.CONSUMER_NAME,
+                handler=self._handle_candle,
+                running=lambda: self.is_running,
+            ),
+            consume_stream(
+                stream=STREAM_SIGNALS_CANDIDATE,
+                group=self.CONSUMER_GROUP + "_candidates",
+                consumer=self.CONSUMER_NAME,
+                handler=self._handle_candidate_signal,
+                running=lambda: self.is_running,
+            )
         )
 
     async def teardown(self):

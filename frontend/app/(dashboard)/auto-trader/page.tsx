@@ -4,6 +4,17 @@ import { useEffect, useState, useCallback } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
+// Cache the last-known enabled state so the toggle shows correct value immediately on mount
+const AT_ENABLED_KEY = "quantdss_at_enabled";
+function readCachedEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try { return localStorage.getItem(AT_ENABLED_KEY) === "true"; } catch { return false; }
+}
+function writeCachedEnabled(val: boolean) {
+  if (typeof window === "undefined") return;
+  try { localStorage.setItem(AT_ENABLED_KEY, String(val)); } catch { }
+}
+
 interface Config {
   enabled: boolean;
   mode: string;
@@ -48,8 +59,8 @@ function authHeaders(): Record<string, string> {
 }
 
 export default function AutoTraderPage() {
-  const [config, setConfig] = useState<Config>({
-    enabled: false,
+  const [config, setConfig] = useState<Config>(() => ({
+    enabled: readCachedEnabled(),  // seed from cache — avoids OFF flash
     mode: "paper",
     sizing_mode: "capital",
     qty_per_trade: 1,
@@ -59,7 +70,7 @@ export default function AutoTraderPage() {
     timeframe: "5min",
     watchlist: [],
     scan_interval_minutes: 5,
-  });
+  }));
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
@@ -73,7 +84,11 @@ export default function AutoTraderPage() {
           headers: authHeaders(),
         }),
       ]);
-      if (cfgRes.ok) setConfig(await cfgRes.json());
+      if (cfgRes.ok) {
+        const cfg = await cfgRes.json();
+        setConfig(cfg);
+        writeCachedEnabled(cfg.enabled);  // keep cache up to date
+      }
       if (logRes.ok) setLogs(await logRes.json());
     } catch (e) {
       console.error("AutoTrader fetch error", e);
@@ -98,7 +113,11 @@ export default function AutoTraderPage() {
         headers: authHeaders(),
         body: JSON.stringify(next),
       });
-      if (res.ok) setConfig(await res.json());
+      if (res.ok) {
+        const updated = await res.json();
+        setConfig(updated);
+        writeCachedEnabled(updated.enabled);  // persist the latest state
+      }
     } catch (e) {
       console.error("Save failed", e);
     } finally {
@@ -107,9 +126,45 @@ export default function AutoTraderPage() {
   };
 
   const toggleEnabled = async () => {
+    const next = !config.enabled;
+    // Write to localStorage immediately so we survive navigation before API returns
+    writeCachedEnabled(next);
     setToggling(true);
-    await saveConfig({ enabled: !config.enabled });
+    await saveConfig({ enabled: next });
     setToggling(false);
+  };
+
+  const submitTradingMode = async (mode: "paper" | "live") => {
+    if (config.mode === mode) return;
+
+    let confirmLive = false;
+    if (mode === "live") {
+      const ask = window.prompt("WARNING: You are switching to LIVE trading mode.\nReal capital will be used. To confirm, type 'LIVE' below:");
+      if (ask !== "LIVE") {
+        alert("Live mode activation aborted.");
+        return;
+      }
+      confirmLive = true;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/v1/auto-trader/trading-mode`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ mode, confirm_live: confirmLive }),
+      });
+      if (res.ok) {
+        const resp = await res.json();
+        setConfig((c) => ({ ...c, mode: resp.db_mode })); // keep in sync with returned db mode
+        alert(resp.message);
+      } else {
+        const err = await res.json();
+        alert(`Failed to switch mode: ${err.detail || "Unknown error"}`);
+      }
+    } catch (e) {
+      console.error("Failed to set trading mode", e);
+      alert("Failed to reach server to switch mode.");
+    }
   };
 
   const resetLogs = async () => {
@@ -160,10 +215,7 @@ export default function AutoTraderPage() {
     }
   };
 
-  if (loading)
-    return (
-      <div className="p-8 text-gray-400 text-center">Loading Auto Trader…</div>
-    );
+  // Don't block the whole page on loading — toggle renders immediately from cache
 
   const actionColor = (action: string) => {
     if (action === "OPEN")
@@ -178,11 +230,10 @@ export default function AutoTraderPage() {
     <div className="space-y-6 max-w-5xl mx-auto">
       {/* ── Hero Toggle ─────────────────────────────────────────────── */}
       <div
-        className={`rounded-2xl border-2 p-6 flex items-center justify-between transition-all ${
-          config.enabled
+        className={`rounded-2xl border-2 p-6 flex items-center justify-between transition-all ${config.enabled
             ? "bg-emerald-950/30 border-emerald-700/60"
             : "bg-gray-900/80 border-gray-800"
-        }`}
+          }`}
       >
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-2">
@@ -204,26 +255,55 @@ export default function AutoTraderPage() {
         <button
           onClick={toggleEnabled}
           disabled={toggling}
-          className={`relative flex items-center gap-3 px-6 py-3 rounded-xl font-bold text-base transition-all duration-300 shadow-lg ${
-            config.enabled
+          className={`relative flex items-center gap-3 px-6 py-3 rounded-xl font-bold text-base transition-all duration-300 shadow-lg ${config.enabled
               ? "bg-emerald-500 hover:bg-emerald-400 text-white shadow-emerald-900/50"
               : "bg-gray-700 hover:bg-gray-600 text-gray-300 shadow-black/30"
-          } ${toggling ? "opacity-60 cursor-not-allowed" : ""}`}
+            } ${toggling ? "opacity-60 cursor-not-allowed" : ""}`}
         >
           {/* Toggle track */}
           <span
-            className={`w-12 h-6 rounded-full relative transition-colors duration-300 ${
-              config.enabled ? "bg-white/30" : "bg-gray-900/50"
-            }`}
+            className={`w-12 h-6 rounded-full relative transition-colors duration-300 ${config.enabled ? "bg-white/30" : "bg-gray-900/50"
+              }`}
           >
             <span
-              className={`absolute top-0.5 w-5 h-5 rounded-full transition-all duration-300 shadow ${
-                config.enabled ? "left-6 bg-white" : "left-0.5 bg-gray-500"
-              }`}
+              className={`absolute top-0.5 w-5 h-5 rounded-full transition-all duration-300 shadow ${config.enabled ? "left-6 bg-white" : "left-0.5 bg-gray-500"
+                }`}
             />
           </span>
           {toggling ? "…" : config.enabled ? "ON" : "OFF"}
         </button>
+      </div>
+
+      {/* ── Trading Mode Selector ──────────────────────────────────── */}
+      <div className="bg-gray-900/80 border border-gray-800 rounded-xl p-5 space-y-5">
+        <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider block">
+          Execution Mode
+        </h2>
+        <div className="flex gap-2">
+          <button
+            onClick={() => submitTradingMode("paper")}
+            className={`px-6 py-2.5 rounded-lg text-sm font-bold uppercase tracking-widest transition ${config.mode === "paper"
+                ? "bg-blue-600/20 text-blue-400 border border-blue-500 shadow-lg shadow-blue-900/20"
+                : "bg-gray-800 text-gray-400 hover:text-gray-200 border border-gray-700"
+              }`}
+          >
+            Paper
+          </button>
+          <button
+            onClick={() => submitTradingMode("live")}
+            className={`px-6 py-2.5 rounded-lg text-sm font-bold uppercase tracking-widest transition ${config.mode === "live"
+                ? "bg-red-500/20 text-red-500 border border-red-500 shadow-lg shadow-red-900/20"
+                : "bg-gray-800 text-gray-400 hover:text-gray-200 border border-gray-700"
+              }`}
+          >
+            Live
+          </button>
+        </div>
+        <p className="text-xs text-gray-500">
+          {config.mode === "paper"
+            ? "Simulated trades using a virtual balance. Safe for testing strategies."
+            : "⚠️ Real orders will be transmitted to the broker. Capital is at risk."}
+        </p>
       </div>
 
       {/* ── Trade Settings ─────────────────────────────────────────── */}
@@ -240,21 +320,19 @@ export default function AutoTraderPage() {
           <div className="flex gap-2">
             <button
               onClick={() => saveConfig({ sizing_mode: "capital" })}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
-                config.sizing_mode === "capital"
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition ${config.sizing_mode === "capital"
                   ? "bg-blue-600 text-white"
                   : "bg-gray-800 text-gray-400 hover:text-white border border-gray-700"
-              }`}
+                }`}
             >
               💰 Capital (₹)
             </button>
             <button
               onClick={() => saveConfig({ sizing_mode: "quantity" })}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
-                config.sizing_mode === "quantity"
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition ${config.sizing_mode === "quantity"
                   ? "bg-blue-600 text-white"
                   : "bg-gray-800 text-gray-400 hover:text-white border border-gray-700"
-              }`}
+                }`}
             >
               📦 Fixed Quantity
             </button>
@@ -343,11 +421,10 @@ export default function AutoTraderPage() {
             Reacts to scanner BUY/SELL signals · Auto-exits on reverse signal
           </span>
           <span
-            className={`px-2 py-0.5 rounded-full border ${
-              saving
+            className={`px-2 py-0.5 rounded-full border ${saving
                 ? "text-yellow-400 border-yellow-800 bg-yellow-950/30"
                 : "text-gray-600 border-gray-800"
-            }`}
+              }`}
           >
             {saving ? "saving…" : "saved"}
           </span>
@@ -359,7 +436,11 @@ export default function AutoTraderPage() {
         <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <h2 className="font-semibold text-white">Activity Log</h2>
-            <span className="text-xs text-gray-500">Refreshes every 15s</span>
+            {loading ? (
+              <span className="text-xs text-blue-400 animate-pulse">Loading…</span>
+            ) : (
+              <span className="text-xs text-gray-500">Refreshes every 15s</span>
+            )}
           </div>
           <div className="flex gap-2">
             <button
@@ -429,11 +510,10 @@ export default function AutoTraderPage() {
                     <td className="px-3 py-2.5">
                       {log.signal ? (
                         <span
-                          className={`text-xs font-bold px-2 py-0.5 rounded-md border ${
-                            log.signal === "BUY"
+                          className={`text-xs font-bold px-2 py-0.5 rounded-md border ${log.signal === "BUY"
                               ? "bg-emerald-950/50 text-emerald-300 border-emerald-800"
                               : "bg-red-950/50 text-red-300 border-red-800"
-                          }`}
+                            }`}
                         >
                           {log.signal}
                         </span>
@@ -462,13 +542,12 @@ export default function AutoTraderPage() {
                     <td className="px-3 py-2.5 text-center">
                       {log.risk_reward ? (
                         <span
-                          className={`text-xs font-semibold px-1.5 py-0.5 rounded ${
-                            log.risk_reward >= 2
+                          className={`text-xs font-semibold px-1.5 py-0.5 rounded ${log.risk_reward >= 2
                               ? "text-emerald-300"
                               : log.risk_reward >= 1
                                 ? "text-yellow-300"
                                 : "text-red-400"
-                          }`}
+                            }`}
                         >
                           {log.risk_reward.toFixed(1)}
                         </span>
@@ -479,13 +558,12 @@ export default function AutoTraderPage() {
                     <td className="px-3 py-2.5 text-center">
                       {log.rsi ? (
                         <span
-                          className={`text-xs font-mono ${
-                            log.rsi >= 70
+                          className={`text-xs font-mono ${log.rsi >= 70
                               ? "text-red-400"
                               : log.rsi <= 30
                                 ? "text-emerald-400"
                                 : "text-gray-400"
-                          }`}
+                            }`}
                         >
                           {log.rsi.toFixed(1)}
                         </span>
@@ -496,13 +574,12 @@ export default function AutoTraderPage() {
                     <td className="px-3 py-2.5">
                       {log.trend ? (
                         <span
-                          className={`text-xs font-semibold ${
-                            log.trend === "UPTREND"
+                          className={`text-xs font-semibold ${log.trend === "UPTREND"
                               ? "text-emerald-400"
                               : log.trend === "DOWNTREND"
                                 ? "text-red-400"
                                 : "text-gray-400"
-                          }`}
+                            }`}
                         >
                           {log.trend === "UPTREND"
                             ? "↑"
@@ -518,8 +595,8 @@ export default function AutoTraderPage() {
                     <td className="px-3 py-2.5 text-xs text-gray-400 whitespace-nowrap">
                       {log.strategy
                         ? log.strategy
-                            .replace(/_/g, " ")
-                            .replace(/\b\w/g, (l) => l.toUpperCase())
+                          .replace(/_/g, " ")
+                          .replace(/\b\w/g, (l) => l.toUpperCase())
                         : "—"}
                     </td>
                     <td className="px-3 py-2.5 text-xs text-gray-500">

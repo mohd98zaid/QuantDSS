@@ -46,7 +46,7 @@ export function saveAlertsToLocal(newAlerts: SavedAlert[]) {
         if (
           idx !== -1 &&
           new Date(alert.timestamp).getTime() >
-            new Date(existing[idx].timestamp).getTime()
+          new Date(existing[idx].timestamp).getTime()
         ) {
           existing[idx].timestamp = alert.timestamp;
           existing[idx].entry_price = alert.entry_price;
@@ -70,41 +70,41 @@ export function saveAlertsToLocal(newAlerts: SavedAlert[]) {
 
 const PRESET_SYMBOLS: Record<string, string[]> = {
   nifty50: [
-    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR",
-    "ITC","SBIN","BHARTIARTL","KOTAKBANK","LT","AXISBANK",
-    "ASIANPAINT","MARUTI","BAJFINANCE","WIPRO","HCLTECH","SUNPHARMA",
-    "TITAN","ULTRACEMCO","BAJAJFINSV","NTPC","POWERGRID","ONGC",
-    "ADANIENT","TATAMOTORS","TATASTEEL","JSWSTEEL","HINDALCO",
-    "COALINDIA","GRASIM","DRREDDY","CIPLA","DIVISLAB","APOLLOHOSP",
-    "BRITANNIA","EICHERMOT","NESTLEIND","HEROMOTOCO","BPCL",
-    "TECHM","INDUSINDBK","M&M","TATACONSUM","BAJAJ-AUTO",
-    "SBILIFE","HDFCLIFE","ADANIPORTS","SHREECEM","UPL",
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR",
+    "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "AXISBANK",
+    "ASIANPAINT", "MARUTI", "BAJFINANCE", "WIPRO", "HCLTECH", "SUNPHARMA",
+    "TITAN", "ULTRACEMCO", "BAJAJFINSV", "NTPC", "POWERGRID", "ONGC",
+    "ADANIENT", "TATAMOTORS", "TATASTEEL", "JSWSTEEL", "HINDALCO",
+    "COALINDIA", "GRASIM", "DRREDDY", "CIPLA", "DIVISLAB", "APOLLOHOSP",
+    "BRITANNIA", "EICHERMOT", "NESTLEIND", "HEROMOTOCO", "BPCL",
+    "TECHM", "INDUSINDBK", "M&M", "TATACONSUM", "BAJAJ-AUTO",
+    "SBILIFE", "HDFCLIFE", "ADANIPORTS", "SHREECEM", "UPL",
   ],
   banknifty: [
-    "HDFCBANK","ICICIBANK","KOTAKBANK","SBIN","AXISBANK",
-    "INDUSINDBK","BANDHANBNK","IDFCFIRSTB","AUBANK","FEDERALBNK",
-    "PNB","BANKBARODA",
+    "HDFCBANK", "ICICIBANK", "KOTAKBANK", "SBIN", "AXISBANK",
+    "INDUSINDBK", "BANDHANBNK", "IDFCFIRSTB", "AUBANK", "FEDERALBNK",
+    "PNB", "BANKBARODA",
   ],
   niftyit: [
-    "TCS","INFY","HCLTECH","WIPRO","TECHM",
-    "MPHASIS","LTTS","PERSISTENT","COFORGE","OFSS",
+    "TCS", "INFY", "HCLTECH", "WIPRO", "TECHM",
+    "MPHASIS", "LTTS", "PERSISTENT", "COFORGE", "OFSS",
   ],
   fno_actives: [
-    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK",
-    "SBIN","AXISBANK","TATAMOTORS","ADANIENT","BAJFINANCE",
-    "ONGC","WIPRO","MARUTI","TITAN","JSWSTEEL",
-    "HINDALCO","TATASTEEL","NTPC","COALINDIA","M&M",
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "SBIN", "AXISBANK", "TATAMOTORS", "ADANIENT", "BAJFINANCE",
+    "ONGC", "WIPRO", "MARUTI", "TITAN", "JSWSTEEL",
+    "HINDALCO", "TATASTEEL", "NTPC", "COALINDIA", "M&M",
   ],
   psu: [
-    "ONGC","NTPC","COALINDIA","POWERGRID","SBIN",
-    "BPCL","BHEL","GAIL","NHPC","NMDC",
-    "SAIL","NALCO","RECLTD","PFC","IRCTC",
-    "IRFC","CONCOR","BEL","HAL","RVNL",
+    "ONGC", "NTPC", "COALINDIA", "POWERGRID", "SBIN",
+    "BPCL", "BHEL", "GAIL", "NHPC", "NMDC",
+    "SAIL", "NALCO", "RECLTD", "PFC", "IRCTC",
+    "IRFC", "CONCOR", "BEL", "HAL", "RVNL",
   ],
   midcap: [
-    "INDIAMART","PAGEIND","ABFRL","BATAINDIA","VOLTAS",
-    "MFSL","POLYCAB","ASTRAL","ALKEM","PIIND",
-    "GLAND","GMRINFRA","RADICO","LALPATHLAB","METROPOLIS",
+    "INDIAMART", "PAGEIND", "ABFRL", "BATAINDIA", "VOLTAS",
+    "MFSL", "POLYCAB", "ASTRAL", "ALKEM", "PIIND",
+    "GLAND", "GMRINFRA", "RADICO", "LALPATHLAB", "METROPOLIS",
   ],
 };
 
@@ -168,8 +168,10 @@ function loadScannerState() {
 
 function saveScannerState(state: Record<string, any>) {
   if (typeof window === "undefined") return;
-  try { localStorage.setItem(SCANNER_STATE_KEY, JSON.stringify(state)); }
-  catch {}
+  try {
+    const existing = loadScannerState() ?? {};
+    localStorage.setItem(SCANNER_STATE_KEY, JSON.stringify({ ...existing, ...state }));
+  } catch { }
 }
 
 function AutoScanner() {
@@ -182,10 +184,32 @@ function AutoScanner() {
   const [strategy, setStrategy] = useState(saved?.strategy ?? "ema_crossover");
   const [timeframe, setTimeframe] = useState(saved?.timeframe ?? "5min");
   const [signalsOnly, setSignalsOnly] = useState(saved?.signalsOnly ?? true);
+  const [scanInterval, setScanInterval] = useState(saved?.scanInterval ?? 5);
   const [loading, setLoading] = useState(false);
   const [scan, setScan] = useState<BulkResponse | null>(null); // never restore scan from storage
   const [error, setError] = useState<string | null>(null);
-  const [autoRefresh, setAutoRefresh] = useState(saved?.autoRefresh ?? 0);
+
+  useEffect(() => {
+    const token = localStorage.getItem("quantdss_token") || "";
+    fetch(`${API_BASE}/v1/auto-trader/config`, {
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` }
+    })
+      .then(r => r.ok ? r.json() : null)
+      .then(c => { if (c && c.scan_interval_minutes) setScanInterval(c.scan_interval_minutes); })
+      .catch(() => { });
+  }, []);
+
+  const updateInterval = async (val: number) => {
+    setScanInterval(val);
+    try {
+      const token = localStorage.getItem("quantdss_token") || "";
+      await fetch(`${API_BASE}/v1/auto-trader/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        body: JSON.stringify({ scan_interval_minutes: val })
+      });
+    } catch (e) { }
+  };
 
   // ── Persist only lightweight settings (NOT scan results) ────────────
   useEffect(() => {
@@ -194,10 +218,10 @@ function AutoScanner() {
       strategy,
       timeframe,
       signalsOnly,
-      autoRefresh,
+      scanInterval,
       // scan results are NOT saved here — too large, causes UI lag
     });
-  }, [presets, strategy, timeframe, signalsOnly, autoRefresh]);
+  }, [presets, strategy, timeframe, signalsOnly, scanInterval]);
 
   function togglePreset(key: string) {
     setPresets((prev) => {
@@ -222,35 +246,78 @@ function AutoScanner() {
     setError(null);
     setScan(null);
     try {
-      const token =
-        typeof window !== "undefined"
-          ? localStorage.getItem("quantdss_token")
-          : null;
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
+      // Bulk endpoint was removed. Fallback to mapping over symbols
+      // with /v1/scanner/analyze (which is the single scan)
+      const scanResults: any[] = [];
+      const fetchHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (typeof window !== "undefined") {
+        const token = localStorage.getItem("quantdss_token");
+        if (token) fetchHeaders["Authorization"] = `Bearer ${token}`;
+      }
+
+      await Promise.all(
+        selectedSymbols.map(async (sym) => {
+          try {
+            const symRes = await fetch(`${API_BASE}/v1/scanner/analyze`, {
+              method: "POST",
+              headers: fetchHeaders,
+              body: JSON.stringify({
+                symbol: sym,
+                strategy,
+                timeframe,
+                candles_limit: 150
+              })
+            });
+            if (symRes.ok) {
+              const symData = await symRes.json();
+              if (symData.signals && symData.signals.length > 0) {
+                const first = symData.signals[0];
+                scanResults.push({
+                  symbol: symData.symbol,
+                  ltp: symData.ltp,
+                  change_pct: symData.change_pct,
+                  signal: first.signal,
+                  entry_price: first.entry_price,
+                  stop_loss: first.stop_loss,
+                  target_price: first.target_price,
+                  risk_reward: first.risk_reward,
+                  strategy_name: first.strategy_name,
+                  rsi: symData.indicators?.rsi_14 ?? null,
+                  trend: symData.indicators?.trend ?? null,
+                  data_source: symData.data_source
+                });
+              } else if (!signalsOnly) {
+                scanResults.push({
+                  symbol: symData.symbol,
+                  ltp: symData.ltp,
+                  change_pct: symData.change_pct,
+                  signal: "NEUTRAL",
+                  entry_price: symData.ltp,
+                  stop_loss: 0,
+                  target_price: 0,
+                  risk_reward: 0,
+                  strategy_name: "",
+                  rsi: symData.indicators?.rsi_14 ?? null,
+                  trend: symData.indicators?.trend ?? null,
+                  data_source: symData.data_source
+                });
+              }
+            }
+          } catch (err) {
+            console.error(err);
+          }
+        })
+      );
+
+      const data: any = {
+        list_name: Array.from(presets)[0] || "custom",
+        strategy: strategy,
+        timeframe: timeframe,
+        total_scanned: selectedSymbols.length,
+        signals_found: scanResults.filter(r => r.signal === "BUY" || r.signal === "SELL").length,
+        results: scanResults.sort((a, b) => b.change_pct - a.change_pct),
+        scanned_at: new Date().toISOString()
       };
-      if (token) headers["Authorization"] = `Bearer ${token}`;
-      const res = await fetch(`${API_BASE}/v1/scanner/bulk`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          list_name: Array.from(presets)[0], // primary name for display
-          custom_symbols: selectedSymbols, // merged deduped list
-          strategy,
-          timeframe,
-          signals_only: signalsOnly,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Scan failed" }));
-        throw new Error(err.detail || "Scan failed");
-      }
-      const data = await res.json();
-      // Patch label to show selected list names
-      if (presets.size > 1) {
-        data.list_name = PRESETS.filter((p) => presets.has(p.key)).map((p) => p.label).join(" + ")
-      }
-      setScan(data);
       if (data.results) {
         const timestamp = new Date().toISOString();
         const newAlerts: SavedAlert[] = data.results
@@ -279,22 +346,49 @@ function AutoScanner() {
     }
   }, [presets, selectedSymbols, strategy, timeframe, signalsOnly]);
 
-  // ── Auto-refresh: tick-only, no immediate scan on mount ──────────────
-  useEffect(() => {
-    if (autoRefresh <= 0) return;
-    const timer = setInterval(() => {
-      runScan();
-    }, autoRefresh * 1000);
-    return () => clearInterval(timer);
-  }, [autoRefresh, runScan]);
+  // ── Background Config Sync ──────────────
+  const updateBackgroundConfig = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const token = localStorage.getItem("quantdss_token") || "";
+      const getRes = await fetch(`${API_BASE}/v1/auto-trader/config`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (!getRes.ok) throw new Error("Failed to fetch current config");
+      const currentConfig = await getRes.json();
+
+      const payload = {
+        ...currentConfig,
+        strategy: strategy,
+        timeframe: timeframe,
+        watchlist: Array.from(presets),
+        scan_interval_minutes: scanInterval
+      };
+
+      const putRes = await fetch(`${API_BASE}/v1/auto-trader/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        body: JSON.stringify(payload)
+      });
+      if (!putRes.ok) throw new Error("Failed to update background config");
+
+      // Optional: show a temporary success indicator
+      alert("✅ Background Scanner Configuration Updated! Background worker will now use these settings.");
+    } catch (e: any) {
+      setError(e.message || "Failed to update background config");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const exportCsv = useCallback(() => {
     if (!scan || !scan.results || scan.results.length === 0) return;
-    
+
     const headers = [
       "Symbol", "LTP", "Change %", "Signal", "Entry Price", "Stop Loss", "Target", "R:R", "Strategy", "RSI", "Trend"
     ];
-    
+
     const rows = scan.results.map(r => [
       r.symbol,
       r.ltp,
@@ -308,12 +402,12 @@ function AutoScanner() {
       r.rsi ?? "",
       r.trend ?? ""
     ]);
-    
+
     const csvContent = [
       headers.join(","),
       ...rows.map(row => row.join(","))
     ].join("\n");
-    
+
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -343,11 +437,10 @@ function AutoScanner() {
                   <button
                     key={p.key}
                     onClick={() => togglePreset(p.key)}
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                      isActive
-                        ? "bg-blue-600 text-white"
-                        : "bg-gray-800 text-gray-400 hover:text-white border border-gray-700"
-                    }`}
+                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${isActive
+                      ? "bg-blue-600 text-white"
+                      : "bg-gray-800 text-gray-400 hover:text-white border border-gray-700"
+                      }`}
                   >
                     {p.label}{" "}
                     <span className="text-xs opacity-60">({p.count})</span>
@@ -385,17 +478,18 @@ function AutoScanner() {
                 <button
                   key={tf}
                   onClick={() => setTimeframe(tf)}
-                  className={`px-2.5 py-2 rounded-lg text-xs font-medium transition-colors ${
-                    timeframe === tf
-                      ? "bg-blue-600 text-white"
-                      : "bg-gray-800 text-gray-400 hover:text-white border border-gray-700"
-                  }`}
+                  className={`px-2.5 py-2 rounded-lg text-xs font-medium transition-colors ${timeframe === tf
+                    ? "bg-blue-600 text-white"
+                    : "bg-gray-800 text-gray-400 hover:text-white border border-gray-700"
+                    }`}
                 >
                   {tf}
                 </button>
               ))}
             </div>
           </div>
+
+
 
           {/* Toggle signals only */}
           <div className="flex items-center gap-2">
@@ -410,19 +504,25 @@ function AutoScanner() {
             <span className="text-xs text-gray-400">Signals only</span>
           </div>
 
-          {/* Auto Refresh */}
+          {/* Background Sync */}
           <div className="flex items-center gap-2 border-l border-gray-700 pl-4 ml-2">
-            <Clock className="w-4 h-4 text-gray-400" />
-            <select
-              value={autoRefresh}
-              onChange={(e) => setAutoRefresh(Number(e.target.value))}
-              className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-blue-500 text-gray-300"
+            <span className="text-xs text-gray-400">Background Scan Interval (m)</span>
+            <input
+              type="number"
+              min="1"
+              max="60"
+              value={scanInterval}
+              onChange={(e) => setScanInterval(Math.max(1, parseInt(e.target.value) || 5))}
+              className="bg-gray-800 border border-gray-700 rounded-lg w-16 px-2 py-1 text-xs focus:outline-none focus:border-blue-500 text-gray-300"
+            />
+            <button
+              onClick={updateBackgroundConfig}
+              disabled={loading}
+              className="ml-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap"
+              title="Save current strategy, timeframe, and lists to the background scanner worker"
             >
-              <option value={0}>Auto: Off</option>
-              <option value={30}>Every 30s</option>
-              <option value={60}>Every 1m</option>
-              <option value={300}>Every 5m</option>
-            </select>
+              Sync to Backend
+            </button>
           </div>
 
           {/* Scan button */}
@@ -478,6 +578,10 @@ function AutoScanner() {
             <div className="flex items-center gap-4 text-sm">
               <span className="text-gray-500">
                 {scan.total_scanned} scanned
+              </span>
+              <span className="text-gray-500 flex items-center gap-1 bg-gray-800/50 px-2 py-1 border border-gray-700/50 rounded" title="Scanned At">
+                <Clock className="w-3.5 h-3.5" />
+                {new Date(scan.scanned_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
               </span>
               <span
                 className={`font-bold ${scan.signals_found > 0 ? "text-emerald-400" : "text-gray-500"}`}
@@ -541,13 +645,12 @@ function AutoScanner() {
                     return (
                       <tr
                         key={r.symbol + i}
-                        className={`border-b border-gray-800/50 last:border-0 hover:bg-gray-800/30 transition-colors ${
-                          isBuy
-                            ? "border-l-2 border-l-emerald-600"
-                            : isSell
-                              ? "border-l-2 border-l-red-600"
-                              : ""
-                        }`}
+                        className={`border-b border-gray-800/50 last:border-0 hover:bg-gray-800/30 transition-colors ${isBuy
+                          ? "border-l-2 border-l-emerald-600"
+                          : isSell
+                            ? "border-l-2 border-l-red-600"
+                            : ""
+                          }`}
                       >
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
@@ -581,11 +684,10 @@ function AutoScanner() {
                         <td className="px-4 py-3 text-center">
                           {isBuy || isSell ? (
                             <span
-                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-bold ${
-                                isBuy
-                                  ? "bg-emerald-950/60 text-emerald-300 border border-emerald-800"
-                                  : "bg-red-950/60 text-red-300 border border-red-800"
-                              }`}
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-bold ${isBuy
+                                ? "bg-emerald-950/60 text-emerald-300 border border-emerald-800"
+                                : "bg-red-950/60 text-red-300 border border-red-800"
+                                }`}
                             >
                               {r.signal}
                             </span>
@@ -612,15 +714,14 @@ function AutoScanner() {
                           {r.risk_reward > 0 ? `1:${r.risk_reward}` : "—"}
                         </td>
                         <td
-                          className={`px-4 py-3 text-right font-mono text-xs ${
-                            r.rsi
-                              ? r.rsi >= 70
-                                ? "text-red-400"
-                                : r.rsi <= 30
-                                  ? "text-emerald-400"
-                                  : "text-gray-400"
-                              : "text-gray-600"
-                          }`}
+                          className={`px-4 py-3 text-right font-mono text-xs ${r.rsi
+                            ? r.rsi >= 70
+                              ? "text-red-400"
+                              : r.rsi <= 30
+                                ? "text-emerald-400"
+                                : "text-gray-400"
+                            : "text-gray-600"
+                            }`}
                         >
                           {r.rsi ? r.rsi.toFixed(1) : "—"}
                         </td>
@@ -718,7 +819,12 @@ function SingleScanner() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
-  const [autoRefresh, setAutoRefresh] = useState(0);
+  const [autoRefresh, setAutoRefresh] = useState(() => loadScannerState()?.singleAutoRefresh ?? 0);
+
+  // Persist SingleScanner autoRefresh
+  useEffect(() => {
+    saveScannerState({ singleAutoRefresh: autoRefresh });
+  }, [autoRefresh]);
   const [suggestions, setSuggestions] = useState<any[]>([]);
   const [sugLoading, setSugLoading] = useState(false);
   const [showSug, setShowSug] = useState(false);
@@ -736,17 +842,18 @@ function SingleScanner() {
     sugTimer.current = setTimeout(async () => {
       setSugLoading(true);
       try {
-        const token =
-          typeof window !== "undefined"
-            ? localStorage.getItem("quantdss_token")
-            : null;
-        const headers: Record<string, string> = {};
-        if (token) headers["Authorization"] = `Bearer ${token}`;
-        const res = await fetch(
-          `${API_BASE}/v1/scanner/search?q=${encodeURIComponent(val)}&limit=10`,
-          { headers },
-        );
-        if (res.ok) setSuggestions((await res.json()).results || []);
+        let found: any[] = [];
+        const srch = val.toUpperCase();
+        for (const list of Object.values(PRESET_SYMBOLS)) {
+          for (const s of list) {
+            if (s.includes(srch) && !found.find(f => f.symbol === s)) {
+              found.push({ symbol: s, name: s });
+              if (found.length >= 10) break;
+            }
+          }
+          if (found.length >= 10) break;
+        }
+        setSuggestions(found);
       } catch {
         setSuggestions([]);
       } finally {
@@ -984,6 +1091,10 @@ function SingleScanner() {
                   ? "📡 Upstox"
                   : "📦 Yahoo Finance"}
               </span>
+              <span className="flex items-center gap-1 text-gray-400 bg-gray-800/50 px-2 py-1 rounded border border-gray-700/50" title="Scanned At">
+                <Clock className="w-3.5 h-3.5" />
+                {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              </span>
             </div>
           </div>
 
@@ -1136,8 +1247,8 @@ function AlertsHistory() {
       const isBuy = a.signal === "BUY";
       const optionType = isBuy ? "CALL" : "PUT";
       const date = new Date(a.timestamp);
-      const timeStr = `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-      
+      const timeStr = `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+
       return [
         `"${timeStr}"`,
         a.symbol,
@@ -1237,18 +1348,17 @@ function AlertsHistory() {
                 return (
                   <tr
                     key={a.id}
-                    className={`border-b border-gray-800/50 last:border-0 hover:bg-gray-800/30 transition-colors ${
-                      isBuy
-                        ? "border-l-2 border-l-emerald-600"
-                        : isSell
-                          ? "border-l-2 border-l-red-600"
-                          : ""
-                    }`}
+                    className={`border-b border-gray-800/50 last:border-0 hover:bg-gray-800/30 transition-colors ${isBuy
+                      ? "border-l-2 border-l-emerald-600"
+                      : isSell
+                        ? "border-l-2 border-l-red-600"
+                        : ""
+                      }`}
                   >
                     {/* Time */}
-                    <td className="px-4 py-3 text-gray-400 text-xs whitespace-nowrap">
-                      {date.toLocaleDateString()}{" "}
-                      {date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    <td className="px-4 py-3 text-gray-400 text-xs whitespace-nowrap space-y-0.5">
+                      <div className="text-gray-300 font-medium">{date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</div>
+                      <div className="text-[10px] text-gray-500 uppercase flex items-center gap-1"><Clock className="w-3 h-3" /> {date.toLocaleDateString()}</div>
                     </td>
 
                     {/* Symbol */}
@@ -1258,22 +1368,20 @@ function AlertsHistory() {
 
                     {/* Signal BUY/SELL */}
                     <td className="px-4 py-3 text-center">
-                      <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold ${
-                        isBuy
-                          ? "bg-emerald-950/60 text-emerald-300 border border-emerald-800"
-                          : "bg-red-950/60 text-red-300 border border-red-800"
-                      }`}>
+                      <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold ${isBuy
+                        ? "bg-emerald-950/60 text-emerald-300 border border-emerald-800"
+                        : "bg-red-950/60 text-red-300 border border-red-800"
+                        }`}>
                         {a.signal}
                       </span>
                     </td>
 
                     {/* CALL / PUT */}
                     <td className="px-4 py-3 text-center">
-                      <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold ${
-                        isBuy
-                          ? "bg-blue-950/60 text-blue-300 border border-blue-800"
-                          : "bg-orange-950/60 text-orange-300 border border-orange-800"
-                      }`}>
+                      <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold ${isBuy
+                        ? "bg-blue-950/60 text-blue-300 border border-blue-800"
+                        : "bg-orange-950/60 text-orange-300 border border-orange-800"
+                        }`}>
                         {optionType}
                       </span>
                     </td>
@@ -1311,21 +1419,19 @@ function AlertsHistory() {
                     </td>
 
                     {/* RSI */}
-                    <td className={`px-4 py-3 text-right font-mono text-xs ${
-                      rsiVal
-                        ? rsiVal >= 70 ? "text-red-400" : rsiVal <= 30 ? "text-emerald-400" : "text-gray-400"
-                        : "text-gray-600"
-                    }`}>
+                    <td className={`px-4 py-3 text-right font-mono text-xs ${rsiVal
+                      ? rsiVal >= 70 ? "text-red-400" : rsiVal <= 30 ? "text-emerald-400" : "text-gray-400"
+                      : "text-gray-600"
+                      }`}>
                       {rsiVal ? rsiVal.toFixed(1) : "—"}
                     </td>
 
                     {/* Trend */}
                     <td className="px-4 py-3">
-                      <span className={`text-xs ${
-                        a.trend === "UPTREND" ? "text-emerald-400"
+                      <span className={`text-xs ${a.trend === "UPTREND" ? "text-emerald-400"
                         : a.trend === "DOWNTREND" ? "text-red-400"
-                        : "text-gray-600"
-                      }`}>
+                          : "text-gray-600"
+                        }`}>
                         {a.trend ?? "—"}
                       </span>
                     </td>
@@ -1362,7 +1468,15 @@ function AlertsHistory() {
 // ─── Main Page ────────────────────────────────────────────────────────
 
 export default function ScannerPage() {
-  const [tab, setTab] = useState<"auto" | "single" | "alerts">("auto");
+  const [tab, setTab] = useState<"auto" | "single" | "alerts">(
+    () => (loadScannerState()?.tab as "auto" | "single" | "alerts") ?? "auto"
+  );
+
+  // Persist active tab so it survives navigation
+  const handleTabChange = (t: "auto" | "single" | "alerts") => {
+    setTab(t);
+    saveScannerState({ tab: t });
+  };
 
   return (
     <div className="space-y-5">
@@ -1378,19 +1492,19 @@ export default function ScannerPage() {
         </div>
         <div className="flex gap-1 bg-gray-900 border border-gray-800 rounded-lg p-1">
           <button
-            onClick={() => setTab("auto")}
+            onClick={() => handleTabChange("auto")}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${tab === "auto" ? "bg-blue-600 text-white" : "text-gray-400 hover:text-white"}`}
           >
             🔍 Auto Scan
           </button>
           <button
-            onClick={() => setTab("single")}
+            onClick={() => handleTabChange("single")}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${tab === "single" ? "bg-blue-600 text-white" : "text-gray-400 hover:text-white"}`}
           >
             📊 Single Stock
           </button>
           <button
-            onClick={() => setTab("alerts")}
+            onClick={() => handleTabChange("alerts")}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${tab === "alerts" ? "bg-blue-600 text-white" : "text-gray-400 hover:text-white"}`}
           >
             <Bell className="w-4 h-4" /> Alerts

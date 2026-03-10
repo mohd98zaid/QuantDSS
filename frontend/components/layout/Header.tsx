@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { getRiskState, getBrokerHealth } from '@/lib/api'
+import { getMarketStatus, getRiskState, getBrokerHealth } from '@/lib/api'
 
 function useISTClock() {
   const [time, setTime] = useState('')
@@ -28,9 +28,7 @@ function useMarketStatusAPI() {
   useEffect(() => {
     async function fetchStatus() {
       try {
-        const res = await fetch('/api/v1/health/market')
-        if (!res.ok) throw new Error('fetch failed')
-        const data = await res.json()
+        const data = await getMarketStatus()
         setIsOpen(data.is_open)
         // Build a label from open/close times
         if (data.is_open) {

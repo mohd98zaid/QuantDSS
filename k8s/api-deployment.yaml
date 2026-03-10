@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quantdss-api
+  labels:
+    app: quantdss-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: quantdss-api
+  template:
+    metadata:
+      labels:
+        app: quantdss-api
+    spec:
+      containers:
+      - name: api
+        image: quantdss/api:latest
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: quantdss-config
+        - secretRef:
+            name: quantdss-secrets
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quantdss-api
+spec:
+  selector:
+    app: quantdss-api
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: quantdss-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: quantdss-api
+            port:
+              number: 8000

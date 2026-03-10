@@ -11,7 +11,7 @@ timezone-aware comparisons.
 from datetime import timezone, datetime, timedelta
 from typing import Dict, Tuple
 
-from app.core.redis_client import get_redis
+from app.core.redis import get_redis
 
 
 class SignalDeduplicator:
@@ -25,7 +25,7 @@ class SignalDeduplicator:
         dedup.record(signal)
     """
 
-    def __init__(self, ttl_seconds: int = 60):
+    def __init__(self, ttl_seconds: int = 600):  # Fix Group 7: was 60s — shorter than scan intervals
         self._ttl_seconds = ttl_seconds
 
     def _make_key(self, symbol_id: int, strategy_id: int, candle_time) -> str:

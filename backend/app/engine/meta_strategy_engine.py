@@ -62,7 +62,7 @@ class MetaStrategyEngine:
             strat_id = candidate.strategy_id
 
             # Gate 1: Strategy Health
-            if strategy_health_monitor.is_disabled(strat_id):
+            if await strategy_health_monitor.is_disabled(strat_id):
                 blocked_reasons.append(
                     f"{strat_name}(id={strat_id}): disabled by health monitor"
                 )

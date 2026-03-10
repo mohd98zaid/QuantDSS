@@ -199,9 +199,7 @@ def setup_scheduler():
 
     scheduler.add_job(_reset_candle_session, "cron", hour=9, minute=15, id="candle_session_reset")
 
-    # Fix C-02: Auto Square-Off at 15:15 IST — close all open positions (NSE intraday rule)
-    from app.engine.auto_trader_engine import auto_square_off
-    scheduler.add_job(auto_square_off, "cron", hour=15, minute=15, id="auto_square_off")
+    # Fix C-02: Auto Square-Off at 15:15 IST — close all open positions    # Auto-square off is now handled by TradeMonitorWorker.top_market_session, "cron", hour=15, minute=30, id="stop_session")
 
     # Market session end — stop signal generation
     scheduler.add_job(stop_market_session, "cron", hour=15, minute=30, id="stop_session")

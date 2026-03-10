@@ -41,7 +41,8 @@ class Signal(Base):
     # Relationships
     strategy = relationship("Strategy", back_populates="signals")
     symbol = relationship("Symbol", back_populates="signals")
-    trades = relationship("Trade", back_populates="signal")
+    # NOTE: Signal.trades relationship intentionally omitted — Trade.signal_id has no FK
+    # to signals table (removed to avoid circular FK issues). Join manually if needed.
 
     __table_args__ = (
         Index("idx_signals_timestamp", "timestamp"),

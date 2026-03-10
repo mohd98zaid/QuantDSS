@@ -2,12 +2,13 @@
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status as http_status
+from fastapi import APIRouter, Depends, HTTPException, Request, status as http_status
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app.api.deps import get_current_user, get_db
+from app.core.rate_limit import limiter
 from app.engine.trading_mode import TradingModeController, TradingMode, is_live_lock_set
 from app.models.auto_trade_config import AutoTradeConfig
 from app.models.auto_trade_log import AutoTradeLog
@@ -98,7 +99,9 @@ async def get_config(
 
 
 @router.put("/auto-trader/config", response_model=AutoTradeConfigSchema)
+@limiter.limit("10/minute")
 async def update_config(
+    request: Request,
     payload: AutoTradeConfigSchema,
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(get_current_user),
@@ -141,7 +144,9 @@ async def get_log(
 
 
 @router.post("/auto-trader/trigger")
+@limiter.limit("10/minute")
 async def manual_trigger(
+    request: Request,
     _user: dict = Depends(get_current_user),
 ):
     """Manually trigger one auto-trader scan cycle (for testing)."""
@@ -183,7 +188,9 @@ async def get_trading_mode(
 
 
 @router.post("/auto-trader/trading-mode", response_model=TradingModeResponse)
+@limiter.limit("10/minute")
 async def set_trading_mode(
+    request: Request,
     payload: TradingModeRequest,
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(get_current_user),
@@ -258,7 +265,9 @@ async def set_trading_mode(
 # ── Emergency Safety Endpoints (Audit Cat. 14) ─────────────────────────────────
 
 @router.post("/auto-trader/halt")
+@limiter.limit("20/minute")
 async def emergency_halt(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
@@ -311,7 +320,9 @@ async def emergency_halt(
 
 
 @router.post("/auto-trader/resume")
+@limiter.limit("5/minute")
 async def resume_after_halt(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
@@ -339,7 +350,9 @@ async def resume_after_halt(
 
 
 @router.post("/auto-trader/close-all")
+@limiter.limit("5/minute")
 async def kill_switch_close_all(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
