@@ -78,7 +78,7 @@ graph TD;
     SSEStreamer --> WebUI[Next.js Dashboard]
     FinalAlert --> Telegram[Telegram Bot]
     
-    subgraph Observability, Self-Healing & Data
+    subgraph Observability ["Observability, Self-Healing & Data"]
         CandleConsumer --> MLStore[(Feature Store)]
         Broker --> TradeMonitor[Trade Monitor Worker]
         TradeMonitor --> Recon[Position Reconciliation]
